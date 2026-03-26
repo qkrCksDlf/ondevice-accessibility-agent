@@ -25,15 +25,34 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+import android.util.Log
+
 data class Message(val text: String, val isUser: Boolean)
+
+
 
 // 앱 전체 테마 색상
 val ThemePurple = Color(0xFF9C27B0)
 val ThemeBackground = Color(0xFFF0F2F5)
 
 class MainActivity : ComponentActivity() {
+
+    // 1. 앱이 켜질 때 C++ 라이브러리(native-lib)를 불러옵니다.
+    init {
+        System.loadLibrary("native-lib")
+    }
+
+    // 2. C++에 만들어둔 함수를 가져오겠다고 선언합니다.
+    external fun stringFromJNI(): String
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 3. 앱이 켜지자마자 C++ 함수를 불러와서 로그캣(Logcat)에 몰래 찍어봅니다.
+        // 화면에는 안 보이지만, 안드로이드 스튜디오 하단 Logcat 창에서 확인할 수 있습니다!
+        Log.d("JNI_TEST", "C++에서 온 메시지: ${stringFromJNI()}")
+
+        // 4. 우리가 만든 예쁜 채팅 화면을 띄웁니다.
         setContent {
             ChatScreen()
         }
