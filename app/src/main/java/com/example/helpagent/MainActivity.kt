@@ -1,6 +1,12 @@
 package com.example.helpagent
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
@@ -22,13 +28,17 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
-import android.util.Log
+import java.io.File
+import java.io.FileOutputStream
 
 data class Message(val text: String, val isUser: Boolean)
-
 
 
 // 앱 전체 테마 색상
@@ -36,38 +46,153 @@ val ThemePurple = Color(0xFF9C27B0)
 val ThemeBackground = Color(0xFFF0F2F5)
 
 class MainActivity : ComponentActivity() {
+    external fun loadWhisperModel(modelPath: String): Boolean
+    external fun transcribeAudio(samples: FloatArray): String
+    external fun releaseWhisperModel()
 
-    // 1. 앱이 켜질 때 C++ 라이브러리(native-lib)를 불러옵니다.
+    private fun copyAssetToInternalStorage(assetName: String, subDir: String = "models"): String {
+        val outDir = File(filesDir, subDir)
+        if (!outDir.exists()) outDir.mkdirs()
+
+        val outFile = File(outDir, assetName.substringAfterLast('/'))
+        if (!outFile.exists()) {
+            assets.open(assetName).use { input ->
+                FileOutputStream(outFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+        }
+        return outFile.absolutePath
+    }
+
+    companion object {
+        private const val RECORD_AUDIO_PERMISSION_CODE = 1001
+    }
+
     init {
         System.loadLibrary("native-lib")
     }
 
-    // 2. C++에 만들어둔 함수를 가져오겠다고 선언합니다.
     external fun stringFromJNI(): String
+
+    private fun ensureAudioPermission() {
+        if (
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                RECORD_AUDIO_PERMISSION_CODE
+            )
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 3. 앱이 켜지자마자 C++ 함수를 불러와서 로그캣(Logcat)에 몰래 찍어봅니다.
-        // 화면에는 안 보이지만, 안드로이드 스튜디오 하단 Logcat 창에서 확인할 수 있습니다!
-        Log.d("JNI_TEST", "C++에서 온 메시지: ${stringFromJNI()}")
+        ensureAudioPermission()
 
-        // 4. 우리가 만든 예쁜 채팅 화면을 띄웁니다.
+        val modelPath = copyAssetToInternalStorage("models/ggml-tiny.bin")
+        val loaded = loadWhisperModel(modelPath)
+        Log.d("WHISPER", "model loaded = $loaded, path = $modelPath")
+
         setContent {
-            ChatScreen()
+            ChatScreen(
+                recordAudio = ::recordAudio3Seconds,
+                transcribeAudio = ::transcribeAudio
+            )
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        releaseWhisperModel()
+    }
+}
+
+/**
+ * 16kHz, mono, PCM 16bit 로 3초 녹음 후 FloatArray 반환
+ */
+fun recordAudio3Seconds(): FloatArray {
+    val sampleRate = 16000
+    val channelConfig = AudioFormat.CHANNEL_IN_MONO
+    val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+
+    val minBufferSize = AudioRecord.getMinBufferSize(
+        sampleRate,
+        channelConfig,
+        audioFormat
+    )
+
+    require(
+        minBufferSize != AudioRecord.ERROR_BAD_VALUE &&
+                minBufferSize != AudioRecord.ERROR
+    ) {
+        "유효한 오디오 버퍼 크기를 가져오지 못했습니다."
+    }
+
+    val recorder = AudioRecord(
+        MediaRecorder.AudioSource.MIC,
+        sampleRate,
+        channelConfig,
+        audioFormat,
+        minBufferSize
+    )
+
+    if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+        throw IllegalStateException("AudioRecord 초기화 실패")
+    }
+
+    val seconds = 3
+    val totalSamples = sampleRate * seconds
+    val shortBuffer = ShortArray(totalSamples)
+
+    recorder.startRecording()
+
+    var offset = 0
+    while (offset < totalSamples) {
+        val read = recorder.read(shortBuffer, offset, totalSamples - offset)
+        if (read > 0) {
+            offset += read
+        }
+    }
+
+    recorder.stop()
+    recorder.release()
+
+    return FloatArray(totalSamples) { i ->
+        shortBuffer[i] / 32768.0f
     }
 }
 
 @Composable
-fun ChatScreen() {
-    var messages by remember { mutableStateOf(listOf(Message("안녕하세요? 무엇을 도와드릴까요?", false))) }
+fun ChatScreen(
+    recordAudio: () -> FloatArray,
+    transcribeAudio: (FloatArray) -> String
+) {
+    var messages by remember {
+        mutableStateOf(listOf(Message("안녕하세요? 무엇을 도와드릴까요?", false)))
+    }
     var inputText by remember { mutableStateOf("") }
 
     val coroutineScope = rememberCoroutineScope()
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
     val listState = rememberLazyListState()
+
+    fun sendMessage(text: String) {
+        if (text.isBlank()) return
+
+        messages = messages + Message(text, true)
+
+        coroutineScope.launch {
+            delay(500)
+            messages = messages + Message("확인했어요: $text", false)
+        }
+    }
 
     LaunchedEffect(Unit) {
         try {
@@ -92,7 +217,6 @@ fun ChatScreen() {
             .systemBarsPadding()
             .imePadding()
     ) {
-        // 상단 바 (Header)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -126,11 +250,14 @@ fun ChatScreen() {
                 colors = ButtonDefaults.textButtonColors(containerColor = Color.Transparent),
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 0.dp)
             ) {
-                Text(text = "새 채팅", color = ThemePurple, fontWeight = FontWeight.Bold)
+                Text(
+                    text = "새 채팅",
+                    color = ThemePurple,
+                    fontWeight = FontWeight.Bold
+                )
             }
         }
 
-        // 메시지 목록 영역
         LazyColumn(
             state = listState,
             modifier = Modifier
@@ -144,7 +271,6 @@ fun ChatScreen() {
             }
         }
 
-        // 하단 입력창 영역
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -168,21 +294,14 @@ fun ChatScreen() {
                     unfocusedBorderColor = Color.Transparent
                 ),
                 trailingIcon = {
-                    // [1] 버튼 영역의 시작 (우측 여백만 살짝 줍니다)
                     Box(modifier = Modifier.padding(end = 4.dp)) {
 
-                        // [2] 조건문: 글자가 한 글자라도 입력되었다면 전송 버튼을 보여줍니다.
                         if (inputText.isNotBlank()) {
                             IconButton(
                                 onClick = {
                                     val userText = inputText
-                                    messages = messages + Message(userText, true)
-                                    inputText = "" // 전송 후 입력창을 비우면 자동으로 마이크 버튼으로 돌아갑니다.
-
-                                    coroutineScope.launch {
-                                        delay(500)
-                                        messages = messages + Message(userText, false)
-                                    }
+                                    inputText = ""
+                                    sendMessage(userText)
                                 },
                                 modifier = Modifier
                                     .size(32.dp)
@@ -195,12 +314,28 @@ fun ChatScreen() {
                                     fontWeight = FontWeight.ExtraBold
                                 )
                             }
-                        }
-                        // [3] 조건문: 글자가 비어있다면 마이크 버튼을 보여줍니다.
-                        else {
+                        } else {
                             IconButton(
                                 onClick = {
-                                    messages = messages + Message("음성인식!", false)
+                                    coroutineScope.launch {
+                                        try {
+                                            messages = messages + Message("3초간 녹음 시작...", false)
+
+                                            val audioSamples = withContext(Dispatchers.IO) {
+                                                recordAudio()
+                                            }
+
+                                            val recognizedText = transcribeAudio(audioSamples)
+
+                                            sendMessage(recognizedText)
+
+                                        } catch (e: Exception) {
+                                            messages = messages + Message(
+                                                "녹음 실패: ${e.message}",
+                                                false
+                                            )
+                                        }
+                                    }
                                 },
                                 modifier = Modifier
                                     .size(32.dp)
