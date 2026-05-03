@@ -1,17 +1,34 @@
-# Android / Gradle
-.gradle
-/build
-/local.properties
-local.properties
+﻿# Android Build
+.gradle/
+build/
+.cxx/
+*.apk
+*.aab
+captures/
 
-# IDE
-.idea
+# Android Studio
+.idea/
 *.iml
+local.properties
+.kotlin/
 
-# Native / NDK
-.externalNativeBuild
-.cxx
+# Native build artifacts
+**/*.so
+**/*.exe
+**/*.a
+**/*.lib
+**/*.obj
+**/*.o
 
-# Misc
+# llama.cpp source (사용자가 직접 clone)
+app/src/main/cpp/llama.cpp/
+app/src/main/cpp/llama.cpp_old/
+
+# Models (GitHub 100MB 제한 + 라이선스)
+*.gguf
+*.bin
+app/src/main/assets/models/
+
+# OS
 .DS_Store
-/captures
+Thumbs.db

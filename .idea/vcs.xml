@@ -2,6 +2,9 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
-    <mapping directory="$USER_HOME$/OneDrive/바탕 화면/ai_whdtjf" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/app/src/main/cpp/llama.cpp" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/app/src/main/cpp/llama.cpp/ggml/src/ggml-kompute/kompute" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/app/src/main/cpp/llama.cpp/ggml/src/kompute" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/app/src/main/cpp/llama.cpp_old" vcs="Git" />
   </component>
 </project>
