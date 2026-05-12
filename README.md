@@ -18,4 +18,9 @@ git checkout b4500
 git submodule update --init --recursive
 ```
 
-이후 허깅페이스에서 모델 다운받은 후 
+이후 허깅페이스에서 모델 다운 후 app/src/main 안에 assets폴더를 만듭니다. (폴더 이름을 assets로)
+그리고 그 assets폴더 안에 models폴더를 만들고 그 안에 넣으시면 됩니다.
+
+
+llama-3.2-3b-instruct-q4_k_m.gguf를 다운받으시면 됩니다. 
+혹은 다른 모델 사용하고 싶으시면 그 모델을 다운 받아서 옮긴 후 메인엑티비티.kt에서 MODEL_ASSET_PATH찾으신 후 해당 모델 이름에 맞게 바꿔주세요.
