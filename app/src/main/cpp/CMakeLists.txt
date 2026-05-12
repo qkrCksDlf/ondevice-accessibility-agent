@@ -23,6 +23,12 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static libs" FORCE)
 set(GGML_VULKAN OFF CACHE BOOL "Disable Vulkan backend" FORCE)
 
 # ========================================================
+# Vulkan 백엔드 비활성화 (CPU 전용)
+# ========================================================
+#set(GGML_VULKAN OFF CACHE BOOL "Disable Vulkan backend" FORCE)
+
+
+# ========================================================
 # 🌟 b4500: 호스트(Windows) MSVC toolchain 파일 지정
 # ========================================================
 set(GGML_VULKAN_SHADERS_GEN_TOOLCHAIN

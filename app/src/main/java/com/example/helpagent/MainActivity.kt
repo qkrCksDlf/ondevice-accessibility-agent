@@ -85,41 +85,6 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-
-//fun buildAdvancedPrompt(userInput: String, currentItems: List<String>): String {
-//    val itemsContext = if (currentItems.isNotEmpty()) {
-//        currentItems.mapIndexed { index, item -> "${index + 1}. $item" }.joinToString("\n")
-//    } else {
-//        "없음"
-//    }
-//
-//    return """<|system|>
-//You are a JSON API. Output only valid JSON. No other text.
-//
-//Current items:
-//$itemsContext
-//
-//Output schema:
-//{"intent":"chat|buy_product|select_item","query":"string","msg":"string"}
-//
-//EXAMPLES:
-//User: 안녕
-//{"intent":"chat","query":"","msg":"안녕하세요! 필요한 물건이 있으면 편하게 말씀해 주세요."}
-//
-//User: 라면 사줘
-//{"intent":"buy_product","query":"라면","msg":"네, 라면 검색을 시작합니다."}
-//
-//Rules:
-//- intent=chat: general conversation, answer in msg (Korean)
-//- intent=buy_product: user wants to buy something, set query to product name
-//- intent=select_item: user selects a listed item, set query to exact item name
-//- msg must always be warm Korean suitable for elderly users
-//- Never output anything outside the JSON object<|end|>
-//<|user|>
-//$userInput<|end|>
-//<|assistant|>
-//{""".trimIndent()
-//}
 fun buildAdvancedPrompt(userInput: String, currentItems: List<String>): String {
     val itemsContext = if (currentItems.isNotEmpty()) {
         currentItems.mapIndexed { index, item -> "${index + 1}. $item" }.joinToString("\n")
@@ -128,33 +93,51 @@ fun buildAdvancedPrompt(userInput: String, currentItems: List<String>): String {
     }
 
     return """<|start_header_id|>system<|end_header_id|>
+당신은 JSON만 출력하는 분류기입니다.
 
-You are a JSON API. Output only valid JSON. No other text.
+규칙:
+- 사용자가 "사다/구매/필요해/떨어졌어/주문" 등 구매 의도를 명확히 표현했을 때만 buy_product
+- 그 외 모든 일상 대화, 감정 표현, 질문은 chat
+- 애매하면 무조건 chat
 
-Current items:
-$itemsContext
+목록: $itemsContext
 
-Output schema:
-{"intent":"chat|buy_product|select_item","query":"string","msg":"string"}
+형식: {"intent":"chat|buy_product|select_item","query":"상품명","msg":"한국어"}
 
-EXAMPLES:
-User: 안녕
-{"intent":"chat","query":"","msg":"안녕하세요! 필요한 물건이 있으면 편하게 말씀해 주세요."}
+예시:
+입력: 안녕
+{"intent":"chat","query":"","msg":"안녕하세요! 무엇을 도와드릴까요?"}
 
-User: 라면 사줘
-{"intent":"buy_product","query":"라면","msg":"네, 라면 검색을 시작합니다."}
+입력: 집에 가고 싶다
+{"intent":"chat","query":"","msg":"오늘도 고생 많으셨어요. 푹 쉬세요."}
 
-Rules:
-- intent=chat: general conversation, answer in msg (Korean)
-- intent=buy_product: user wants to buy something, set query to product name
-- intent=select_item: user selects a listed item, set query to exact item name
-- msg must always be warm Korean suitable for elderly users
-- Never output anything outside the JSON object<|eot_id|><|start_header_id|>user<|end_header_id|>
+입력: 배고파
+{"intent":"chat","query":"","msg":"식사 챙겨 드세요. 필요한 게 있으면 말씀해 주세요."}
 
+입력: 오늘 날씨 어때
+{"intent":"chat","query":"","msg":"날씨는 잘 모르지만, 따뜻하게 입고 다니세요."}
+
+입력: 라면 사줘
+{"intent":"buy_product","query":"라면","msg":"네, 라면을 찾아드릴게요."}
+
+입력: 햇반이 떨어져서 사야 해
+{"intent":"buy_product","query":"햇반","msg":"네, 햇반을 찾아드릴게요."}
+
+입력: 휴지 주문해줘
+{"intent":"buy_product","query":"휴지","msg":"네, 휴지를 찾아드릴게요."}
+
+입력: 우유 필요해
+{"intent":"buy_product","query":"우유","msg":"네, 우유를 찾아드릴게요."}<|eot_id|><|start_header_id|>user<|end_header_id|>
 $userInput<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
 {""".trimIndent()
 }
+
+// 🌟 자동 구매 모드 키워드 감지
+fun isAutoBuyRequest(input: String): Boolean {
+    val autoKeywords = listOf("아무거나", "아무꺼나", "알아서", "괜찮은", "추천", "골라줘", "적당한", "아무")
+    return autoKeywords.any { input.contains(it) }
+}
+
 fun isAccessibilityServiceEnabled(context: Context, serviceClass: Class<*>): Boolean {
     val expectedComponentName = ComponentName(context, serviceClass).flattenToString()
     val enabledServices = Settings.Secure.getString(
@@ -227,10 +210,8 @@ fun ChatScreen(generateResponse: (String) -> String) {
     val listState = rememberLazyListState()
     var currentProductOptions by remember { mutableStateOf<List<String>>(emptyList()) }
 
-    // ✅ STT 상태
     var isListening by remember { mutableStateOf(false) }
 
-    // ✅ 마이크 권한 런처
     val micPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
@@ -239,13 +220,11 @@ fun ChatScreen(generateResponse: (String) -> String) {
         }
     }
 
-    // ✅ SpeechRecognizer 생성 및 해제
     val speechRecognizer = remember { SpeechRecognizer.createSpeechRecognizer(context) }
     DisposableEffect(Unit) {
         onDispose { speechRecognizer.destroy() }
     }
 
-    // ✅ STT 시작 함수
     fun startListening() {
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
             Toast.makeText(context, "이 기기에서는 음성 인식을 사용할 수 없어요.", Toast.LENGTH_SHORT).show()
@@ -260,15 +239,11 @@ fun ChatScreen(generateResponse: (String) -> String) {
         }
 
         speechRecognizer.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) {
-                isListening = true
-            }
+            override fun onReadyForSpeech(params: Bundle?) { isListening = true }
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {
-                isListening = false
-            }
+            override fun onEndOfSpeech() { isListening = false }
             override fun onError(error: Int) {
                 isListening = false
                 val msg = when (error) {
@@ -284,7 +259,7 @@ fun ChatScreen(generateResponse: (String) -> String) {
                 isListening = false
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 if (!matches.isNullOrEmpty()) {
-                    inputText = matches[0] // ✅ 인식된 텍스트를 입력창에 자동 삽입
+                    inputText = matches[0]
                 }
             }
             override fun onPartialResults(partialResults: Bundle?) {}
@@ -332,7 +307,6 @@ fun ChatScreen(generateResponse: (String) -> String) {
             .systemBarsPadding()
             .imePadding()
     ) {
-        // 채팅 메시지 목록
         LazyColumn(
             state = listState,
             modifier = Modifier
@@ -399,14 +373,12 @@ fun ChatScreen(generateResponse: (String) -> String) {
             }
         }
 
-        // 입력 영역
         Row(
             Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // ✅ 마이크 버튼
             IconButton(
                 onClick = {
                     micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
@@ -427,7 +399,6 @@ fun ChatScreen(generateResponse: (String) -> String) {
 
             Spacer(Modifier.width(8.dp))
 
-            // 텍스트 입력창
             OutlinedTextField(
                 value = inputText,
                 onValueChange = { inputText = it },
@@ -443,7 +414,6 @@ fun ChatScreen(generateResponse: (String) -> String) {
 
             Spacer(Modifier.width(8.dp))
 
-            // 전송 버튼
             IconButton(
                 onClick = {
                     if (inputText.isBlank() || isLoading) return@IconButton
@@ -460,8 +430,18 @@ fun ChatScreen(generateResponse: (String) -> String) {
                         if (cmd != null && cmd.intent.isNotEmpty()) {
                             when (cmd.intent) {
                                 "buy_product", "select_item" -> {
-                                    messages = messages + Message(cmd.confirmationText, false)
-                                    AgentController.sendCommand(cmd)
+                                    // 🌟 자동 모드 감지
+                                    val isAuto = isAutoBuyRequest(text)
+                                    val finalCmd = cmd.copy(autoMode = isAuto)
+
+                                    val msgText = if (isAuto) {
+                                        "${cmd.confirmationText}\n\n알아서 골라드릴게요. 결제 직전에 한 번 확인 받을게요."
+                                    } else {
+                                        cmd.confirmationText
+                                    }
+
+                                    messages = messages + Message(msgText, false)
+                                    AgentController.sendCommand(finalCmd)
                                     currentProductOptions = emptyList()
                                 }
                                 "chat" -> {

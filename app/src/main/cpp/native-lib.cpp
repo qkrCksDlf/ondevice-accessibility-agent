@@ -167,7 +167,7 @@ Java_com_example_helpagent_MainActivity_loadLlamaModel(
     g_backend_initialized = true;
 
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 0;   // CPU 전용 (측정 결과 GPU 효과 미미)
+    model_params.n_gpu_layers = -1;   // CPU 전용 (측정 결과 GPU 효과 미미)
     model_params.use_mmap     = true;
     model_params.use_mlock    = false;
 
