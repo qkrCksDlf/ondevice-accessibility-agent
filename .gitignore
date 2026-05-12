@@ -1,4 +1,4 @@
-﻿# Android Build
+# Android Build
 .gradle/
 build/
 .cxx/
@@ -20,14 +20,15 @@ local.properties
 **/*.obj
 **/*.o
 
-# llama.cpp source (사용자가 직접 clone)
+# llama.cpp source
 app/src/main/cpp/llama.cpp/
 app/src/main/cpp/llama.cpp_old/
 
-# Models (GitHub 100MB 제한 + 라이선스)
+# Models
 *.gguf
 *.bin
-app/src/main/assets/models/
+app/src/main/assets/models/*
+!app/src/main/assets/models/.gitkeep
 
 # OS
 .DS_Store
