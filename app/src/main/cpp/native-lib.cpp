@@ -338,6 +338,11 @@ Java_com_example_helpagent_MainActivity_generateLlamaResponse(
     bool json_closed = false;
     int n_generated = 0;
 
+// 🌟 괄호 균형 추적 (prefill에서 이미 { 1개 들어감)
+    int brace_depth = has_prefill ? 1 : 0;
+    bool in_string = false;
+    bool escape = false;
+
     auto t_gen_start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < DEFAULT_MAX_TOKENS; ++i) {
@@ -349,10 +354,31 @@ Java_com_example_helpagent_MainActivity_generateLlamaResponse(
         output += piece;
         n_generated++;
 
-        if (output.find('}') != std::string::npos) {
-            json_closed = true;
-            break;
+        // 🌟 piece 안의 글자들을 하나씩 보면서 괄호 짝 추적
+        for (char c : piece) {
+            if (escape) {
+                escape = false;
+                continue;
+            }
+            if (c == '\\' && in_string) {
+                escape = true;
+                continue;
+            }
+            if (c == '"') {
+                in_string = !in_string;
+                continue;
+            }
+            if (in_string) continue;
+            if (c == '{') brace_depth++;
+            else if (c == '}') {
+                brace_depth--;
+                if (brace_depth <= 0) {
+                    json_closed = true;
+                    break;
+                }
+            }
         }
+        if (json_closed) break;
 
         llama_batch batch = llama_batch_get_one(&new_token_id, 1);
         if (llama_decode(g_ctx, batch) != 0) break;

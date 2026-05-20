@@ -1,14 +1,21 @@
 package com.example.helpagent
 
+import android.Manifest
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.text.InputType
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -16,10 +23,13 @@ import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.inputmethod.EditorInfo
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 
 class AutoAgentService : AccessibilityService() {
@@ -31,8 +41,19 @@ class AutoAgentService : AccessibilityService() {
     private var overlayView: View? = null
 
     private var userActionDeferred: CompletableDeferred<String>? = null
-
     private var currentQuery: String = ""
+
+    private var ktxDeparture: String = ""
+    private var ktxArrival: String = ""
+
+    private var ktxQuestionView: TextView? = null
+    private var ktxInputView: EditText? = null
+    private var ktxMicView: TextView? = null
+    private var ktxButtonRow: LinearLayout? = null
+    private var ktxInputRow: LinearLayout? = null
+    private var ktxIsListening: Boolean = false
+    private var ktxRecognizer: SpeechRecognizer? = null
+    private var ktxInputDeferred: CompletableDeferred<String>? = null
 
     companion object {
         const val THEME_PURPLE = "#9C27B0"
@@ -42,19 +63,20 @@ class AutoAgentService : AccessibilityService() {
         const val TEXT_GRAY = "#666666"
         const val CANCEL_RED = "#F44336"
         const val AUTO_GREEN = "#4CAF50"
+
+        const val KORAIL_PACKAGE = "com.korail.talk"
+        const val ID_DEPARTURE_STATION = "com.korail.talk:id/v_departure_station"
+        const val ID_ARRIVAL_STATION = "com.korail.talk:id/v_arrival_station"
+        const val ID_GOING_DATE = "com.korail.talk:id/rl_going_date"
+        const val ID_ROUND_TRIP_CHECKBOX = "com.korail.talk:id/cb_round_trip"
+        const val ID_SEARCH_BUTTON = "com.korail.talk:id/btn_right"
+        const val ID_STATION_NAME_TXT = "com.korail.talk:id/stationNameTxt"
     }
 
     enum class AgentState {
-        WAIT_FOR_RESULTS_LOAD,
-        WAIT_USER_PICK,
-        WAIT_USER_BUY_DECISION,
-        AUTO_WAIT_RESULTS,
-        AUTO_CLICK_FIRST_ITEM,
-        AUTO_WAIT_DETAIL,
-        CLICK_BUY_NOW,
-        WAIT_FOR_PAYMENT_PAGE,
-        DONE,
-        CANCELLED
+        WAIT_FOR_RESULTS_LOAD, WAIT_USER_PICK, WAIT_USER_BUY_DECISION,
+        AUTO_WAIT_RESULTS, AUTO_CLICK_FIRST_ITEM, AUTO_WAIT_DETAIL,
+        CLICK_BUY_NOW, WAIT_FOR_PAYMENT_PAGE, DONE, CANCELLED
     }
 
     override fun onServiceConnected() {
@@ -64,38 +86,966 @@ class AutoAgentService : AccessibilityService() {
 
         serviceScope.launch {
             AgentController.commandFlow.collect { command ->
-                if (command.intent == "buy_product" || command.intent == "select_item") {
-                    runCoupangAutomation(command.query, command.autoMode)
+                when (command.intent) {
+                    "buy_product", "select_item" -> runCoupangAutomation(command.query, command.autoMode)
+                    "book_ktx" -> {
+                        when (command.stage) {
+                            "launch" -> runKtxFlow()
+                        }
+                    }
                 }
             }
         }
     }
 
+    // ============================================
+    // 🌟 코레일톡 윈도우 root
+    // ============================================
+    private fun getKorailRoot(): AccessibilityNodeInfo? {
+        val allWindows = windows ?: return null
+        val korailWindows = allWindows.filter {
+            it.root?.packageName?.toString() == KORAIL_PACKAGE
+        }
+        if (korailWindows.isEmpty()) return null
+        return korailWindows.firstOrNull { it.isFocused }?.root
+            ?: korailWindows.last().root
+    }
+
+    // ============================================
+    // 🌟 진단 로그
+    // ============================================
+    private fun debugDumpScreen(label: String) {
+        Log.d("KtxDebug", "===== [$label] 시작 =====")
+        val allWindows = windows
+        if (allWindows == null) {
+            Log.d("KtxDebug", "[$label] windows == null")
+            Log.d("KtxDebug", "===== [$label] 끝 =====")
+            return
+        }
+        Log.d("KtxDebug", "[$label] 윈도우 개수: ${allWindows.size}")
+        for ((idx, window) in allWindows.withIndex()) {
+            val root = window.root
+            val pkg = root?.packageName?.toString() ?: "null"
+            val type = window.type
+            val title = window.title?.toString() ?: "null"
+            Log.d("KtxDebug", "  window[$idx] pkg=$pkg type=$type title=$title focused=${window.isFocused}")
+            if (root != null && pkg == KORAIL_PACKAGE) {
+                val nodes = root.findAllNodes()
+                nodes.forEach { node ->
+                    val t = node.text?.toString() ?: ""
+                    val d = node.contentDescription?.toString() ?: ""
+                    val id = node.viewIdResourceName ?: ""
+                    if (t.isNotBlank() || d.isNotBlank() || id.isNotBlank()) {
+                        Log.d("KtxDebug", "    text='$t' desc='$d' id=$id clickable=${node.isClickable}")
+                    }
+                }
+            }
+        }
+        Log.d("KtxDebug", "===== [$label] 끝 =====")
+    }
+
+    // ============================================
+    // 🌟 노드 찾기 헬퍼
+    // ============================================
+    private fun findById(resourceId: String): AccessibilityNodeInfo? {
+        val root = getKorailRoot() ?: return null
+        return root.findAccessibilityNodeInfosByViewId(resourceId).firstOrNull()
+    }
+
+    private fun clickById(resourceId: String): Boolean {
+        val node = findById(resourceId)
+        Log.d("KtxFlow", "clickById($resourceId): found=${node != null}")
+        return node?.performClickRecursive() ?: false
+    }
+
+    private fun findExactText(target: String): AccessibilityNodeInfo? {
+        val root = getKorailRoot() ?: return null
+        val nodes = root.findAccessibilityNodeInfosByText(target)
+        val exactMatches = nodes.filter { it.text?.toString()?.trim() == target }
+        val withClickable = exactMatches.firstOrNull { findClickableAncestor(it) != null }
+        return withClickable ?: exactMatches.firstOrNull()
+    }
+
+    private fun findStationInList(stationName: String): AccessibilityNodeInfo? {
+        val root = getKorailRoot() ?: return null
+        val allNodes = root.findAllNodes()
+        val candidates = allNodes.filter {
+            it.viewIdResourceName == ID_STATION_NAME_TXT &&
+                    it.text?.toString()?.trim() == stationName
+        }
+        Log.d("KtxFlow", "findStationInList('$stationName'): ${candidates.size}개 발견")
+        candidates.forEachIndexed { i, node ->
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+            Log.d("KtxFlow", "  [$i] bounds=$rect clickable=${node.isClickable}")
+        }
+        return candidates.firstOrNull()
+    }
+
+    private fun findFirstEditable(): AccessibilityNodeInfo? {
+        val root = getKorailRoot() ?: return null
+        return root.findAllNodes().firstOrNull {
+            it.isEditable || it.className?.toString() == "android.widget.EditText"
+        }
+    }
+
+    private fun setEditTextValue(node: AccessibilityNodeInfo, text: String): Boolean {
+        val args = Bundle()
+        args.putCharSequence(
+            AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text
+        )
+        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    }
+
+    private fun clickSearchButton(): Boolean {
+        val root = getKorailRoot() ?: return false
+        val target = root.findAllNodes().firstOrNull {
+            val t = it.text?.toString() ?: ""
+            val d = it.contentDescription?.toString() ?: ""
+            t == "검색" || d == "검색" || d.contains("search", ignoreCase = true)
+        }
+        Log.d("KtxFlow", "clickSearchButton: found=${target != null}")
+        return target?.performClickRecursive() ?: false
+    }
+
+    // ============================================
+    // 🌟 KTX 전체 흐름
+    // ============================================
+    private fun runKtxFlow() {
+        Log.d("KtxFlow", "🌟 runKtxFlow 호출됨")
+        val intent = packageManager.getLaunchIntentForPackage(KORAIL_PACKAGE)
+        if (intent == null) {
+            serviceScope.launch(Dispatchers.Main) {
+                Toast.makeText(applicationContext, "코레일톡이 설치되어 있지 않아요.", Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        startActivity(intent)
+
+        automationJob?.cancel()
+        automationJob = serviceScope.launch(Dispatchers.Main) {
+            try {
+                delay(2500)
+                debugDumpScreen("코레일톡 메인 진입")
+
+                // ===== 1) 출발역 =====
+                showKtxInputOverlay("출발역을 입력해주세요\n(예: 서울, 대전, 부산)")
+                val departure = waitForInput() ?: run { removeKtxOverlay(); return@launch }
+                ktxDeparture = departure
+                Log.d("KtxFlow", "출발역: $departure")
+
+                if (!selectStation(departure, isDeparture = true)) {
+                    fail("출발역 '$departure' 설정 실패")
+                    return@launch
+                }
+
+                // ===== 2) 도착역 =====
+                showInputRow()
+                updateKtxQuestion("도착역을 입력해주세요")
+                val arrival = waitForInput() ?: run { removeKtxOverlay(); return@launch }
+                ktxArrival = arrival
+                Log.d("KtxFlow", "도착역: $arrival")
+
+                if (!selectStation(arrival, isDeparture = false)) {
+                    fail("도착역 '$arrival' 설정 실패")
+                    return@launch
+                }
+
+                // ===== 3) 가는날 =====
+                removeKtxOverlay()
+                delay(1000)
+                if (!clickById(ID_GOING_DATE)) {
+                    fail("가는날 영역 못 찾음")
+                    return@launch
+                }
+                delay(2000)
+
+                showKtxGuideOverlay(
+                    "갈 날짜를 선택하고 확인 버튼을 누르세요!",
+                    showHelpButton = false
+                )
+
+                val dateCheckJob = serviceScope.launch {
+                    for (i in 1..120) {
+                        delay(1000)
+                        if (findById(ID_DEPARTURE_STATION) != null &&
+                            findById(ID_ROUND_TRIP_CHECKBOX) != null) {
+                            Log.d("KtxFlow", "메인 복귀 감지 (${i}초)")
+                            ktxInputDeferred?.complete("done")
+                            break
+                        }
+                    }
+                }
+
+                val dateResult = waitForGuideAction()
+                dateCheckJob.cancel()
+                if (dateResult == null) {
+                    Log.d("KtxFlow", "사용자가 취소함")
+                    removeKtxOverlay()
+                    return@launch
+                }
+                removeKtxOverlay()
+                delay(1000)
+
+                // ===== 4) 편도/왕복 =====
+                showKtxInputOverlay("편도인가요, 왕복인가요?")
+                hideInputRow()
+                delay(500)
+                showTripTypeButtons()
+                val tripType = waitForTripType()
+                hideTripTypeButtons()
+
+                if (tripType == "round") {
+                    updateKtxQuestion("왕복으로 설정 중...")
+                    if (!clickById(ID_ROUND_TRIP_CHECKBOX)) {
+                        fail("왕복 체크박스 못 찾음")
+                        return@launch
+                    }
+                    delay(1500)
+
+                    removeKtxOverlay()
+                    delay(1000)
+
+                    val returnDateNode = findById("com.korail.talk:id/rl_arrival_date")
+                        ?: findById("com.korail.talk:id/rl_return_date")
+                        ?: findExactText("오는날")?.let { findClickableAncestor(it) }
+                        ?: findExactText("도착일")?.let { findClickableAncestor(it) }
+                    if (returnDateNode == null) {
+                        fail("오는날 영역 못 찾음")
+                        return@launch
+                    }
+                    returnDateNode.performClickRecursive()
+                    delay(2000)
+
+                    showKtxGuideOverlay(
+                        "오는 날짜를 선택하고 확인 버튼을 누르세요!",
+                        showHelpButton = false
+                    )
+
+                    val returnCheckJob = serviceScope.launch {
+                        for (i in 1..120) {
+                            delay(1000)
+                            if (findById(ID_DEPARTURE_STATION) != null &&
+                                findById(ID_SEARCH_BUTTON) != null) {
+                                Log.d("KtxFlow", "오는날 메인 복귀 (${i}초)")
+                                ktxInputDeferred?.complete("done")
+                                break
+                            }
+                        }
+                    }
+
+                    val returnResult = waitForGuideAction()
+                    returnCheckJob.cancel()
+                    if (returnResult == null) {
+                        Log.d("KtxFlow", "사용자가 취소함")
+                        removeKtxOverlay()
+                        return@launch
+                    }
+                    removeKtxOverlay()
+                    delay(1000)
+                }
+
+                // ===== 5) 열차조회 =====
+                Toast.makeText(applicationContext, "열차 조회 중...", Toast.LENGTH_SHORT).show()
+                delay(500)
+                if (!clickById(ID_SEARCH_BUTTON)) {
+                    fail("열차조회 버튼 못 찾음")
+                    return@launch
+                }
+                delay(2500)
+                debugDumpScreen("열차조회 결과 화면")
+
+                // 🌟 안내 + 화면 변화 감지
+                showKtxGuideOverlay(
+                    "원하는 시간대의 '예매' 버튼을 눌러주세요",
+                    showHelpButton = true
+                )
+
+                val trainSelectJob = serviceScope.launch {
+                    delay(2000)
+                    for (i in 1..120) {
+                        delay(1000)
+                        val root = getKorailRoot() ?: continue
+                        val nodes = root.findAllNodes()
+                        val isNextScreen = nodes.any {
+                            val t = it.text?.toString() ?: ""
+                            t.contains("좌석선택") || t.contains("좌석 선택") ||
+                                    t.contains("결제하기") || t.contains("예매하기") ||
+                                    t.contains("자동배정") || t.contains("간편결제")
+                        }
+                        if (isNextScreen) {
+                            Log.d("KtxFlow", "예매 후 다음 화면 감지 (${i}초)")
+                            ktxInputDeferred?.complete("done")
+                            break
+                        }
+                    }
+                }
+
+                val reserveResult = waitForGuideAction()
+                trainSelectJob.cancel()
+                if (reserveResult == null) {
+                    Log.d("KtxFlow", "사용자가 취소함")
+                    removeKtxOverlay()
+                    return@launch
+                } else if (reserveResult == "help") {
+                    Toast.makeText(applicationContext,
+                        "도움 기능은 준비 중입니다.",
+                        Toast.LENGTH_SHORT).show()
+                    removeKtxOverlay()
+                    return@launch
+                }
+                removeKtxOverlay()
+                delay(1000)
+                debugDumpScreen("예매 후 화면")
+
+                // ===== 6) 좌석 선택 옵션 =====
+                showKtxSeatOptionOverlay()
+                val seatChoice = waitForGuideAction()
+                if (seatChoice == null) {
+                    Log.d("KtxFlow", "사용자가 취소함")
+                    removeKtxOverlay()
+                    return@launch
+                }
+                removeKtxOverlay()
+                delay(500)
+
+                if (seatChoice == "select_seat") {
+                    Log.d("KtxFlow", "좌석 선택 모드")
+                    val seatBtn = findExactText("좌석선택")?.let { findClickableAncestor(it) }
+                        ?: findExactText("좌석 선택")?.let { findClickableAncestor(it) }
+                    if (seatBtn == null) {
+                        fail("좌석선택 버튼 못 찾음")
+                        return@launch
+                    }
+                    seatBtn.performClickRecursive()
+                    delay(2000)
+                    debugDumpScreen("좌석 선택 화면")
+
+                    showKtxGuideOverlay(
+                        "원하는 좌석을 그림에서 선택하고\n아래의 '선택 완료' 버튼을 누르세요.\n위에서 다른 칸으로 바꿀 수 있습니다.",
+                        showHelpButton = false,
+                        topPosition = true
+                    )
+
+                    val seatDoneJob = serviceScope.launch {
+                        delay(3000)
+                        for (i in 1..120) {
+                            delay(1000)
+                            val root = getKorailRoot() ?: continue
+                            val nodes = root.findAllNodes()
+                            val backToList = nodes.any {
+                                val t = it.text?.toString() ?: ""
+                                t.contains("자동배정") || t.contains("결제하기") || t.contains("예매하기")
+                            } && nodes.none {
+                                val t = it.text?.toString() ?: ""
+                                t.contains("선택완료") || t.contains("선택 완료")
+                            }
+                            if (backToList) {
+                                Log.d("KtxFlow", "좌석 선택 완료 후 복귀 감지 (${i}초)")
+                                ktxInputDeferred?.complete("done")
+                                break
+                            }
+                        }
+                    }
+
+                    val seatDoneResult = waitForGuideAction()
+                    seatDoneJob.cancel()
+                    if (seatDoneResult == null) {
+                        Log.d("KtxFlow", "사용자가 취소함")
+                        removeKtxOverlay()
+                        return@launch
+                    }
+                    removeKtxOverlay()
+                    delay(1000)
+                    debugDumpScreen("좌석 선택 후 화면")
+                }
+
+                // ===== 7) 예매하기/결제 버튼 자동 클릭 =====
+                Toast.makeText(applicationContext, "예매를 진행할게요...", Toast.LENGTH_SHORT).show()
+                delay(500)
+
+                val reserveBtn = findExactText("예매하기")?.let { findClickableAncestor(it) }
+                    ?: findExactText("예매")?.let { findClickableAncestor(it) }
+                    ?: findExactText("결제하기")?.let { findClickableAncestor(it) }
+
+                if (reserveBtn != null) {
+                    reserveBtn.performClickRecursive()
+                    Log.d("KtxFlow", "예매/결제 버튼 클릭")
+                    delay(2000)
+                    debugDumpScreen("예매 후 최종 화면")
+                    Toast.makeText(applicationContext, "예매를 진행했습니다!", Toast.LENGTH_LONG).show()
+                } else {
+                    Log.w("KtxFlow", "예매 버튼 못 찾음")
+                    Toast.makeText(applicationContext,
+                        "예매 버튼을 직접 눌러주세요",
+                        Toast.LENGTH_LONG).show()
+                }
+                removeKtxOverlay()
+
+            } catch (e: Exception) {
+                Log.e("KtxFlow", "코루틴 예외", e)
+                Toast.makeText(applicationContext, "에러: ${e.message}", Toast.LENGTH_LONG).show()
+                removeKtxOverlay()
+            }
+        }
+    }
+
+    // ============================================
+    // 🌟 역 선택 흐름
+    // ============================================
+    private suspend fun selectStation(stationName: String, isDeparture: Boolean): Boolean {
+        val fieldId = if (isDeparture) ID_DEPARTURE_STATION else ID_ARRIVAL_STATION
+        val label = if (isDeparture) "출발역" else "도착역"
+
+        updateKtxQuestion("'$stationName'(으)로 설정 중...")
+        hideInputRow()
+        delay(1500)
+
+        debugDumpScreen("[$label] 클릭 직전 화면")
+
+        Log.d("KtxFlow", "[$label] 영역 클릭 시도")
+        if (!clickById(fieldId)) {
+            Log.e("KtxFlow", "[$label] 영역 클릭 실패")
+            return false
+        }
+        delay(800)
+
+        val editNode = findFirstEditable()
+        if (editNode == null) {
+            Log.e("KtxFlow", "[$label] EditText 못 찾음")
+            return false
+        }
+        Log.d("KtxFlow", "[$label] EditText 찾음, 클릭")
+        editNode.performClickRecursive()
+        delay(300)
+
+        Log.d("KtxFlow", "[$label] 텍스트 입력: $stationName")
+        val setOk = setEditTextValue(editNode, stationName)
+        Log.d("KtxFlow", "[$label] setText 결과: $setOk")
+        delay(300)
+
+        val searchClicked = clickSearchButton()
+        Log.d("KtxFlow", "[$label] 검색 버튼 클릭: $searchClicked")
+        delay(800)
+
+        debugDumpScreen("[$label] 검색 결과 화면")
+
+        val target = findStationInList(stationName)
+        if (target == null) {
+            Log.e("KtxFlow", "[$label] '$stationName' 못 찾음 (stationNameTxt)")
+            return false
+        }
+
+        val targetRect = Rect()
+        target.getBoundsInScreen(targetRect)
+        Log.d("KtxFlow", "[$label] 클릭 대상: bounds=$targetRect clickable=${target.isClickable}")
+
+        Log.d("KtxFlow", "[$label] 결과 클릭")
+        val ok = target.performClickRecursive()
+        Log.d("KtxFlow", "[$label] 클릭 결과: $ok")
+
+        if (!ok) {
+            Log.e("KtxFlow", "[$label] 클릭 실패")
+            return false
+        }
+
+        Log.d("KtxFlow", "[$label] 메인 복귀 대기 중...")
+        for (i in 1..10) {
+            delay(500)
+            if (findById(ID_DEPARTURE_STATION) != null && findById(ID_GOING_DATE) != null) {
+                Log.d("KtxFlow", "[$label] 메인 복귀 확인 (${i * 500}ms)")
+                delay(500)
+                return true
+            }
+        }
+        Log.w("KtxFlow", "[$label] 메인 복귀 안 됨")
+        return true
+    }
+
+    private fun findClickableAncestor(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var current: AccessibilityNodeInfo? = node
+        var depth = 0
+        while (current != null && depth < 5) {
+            if (current.isClickable) return current
+            current = current.parent
+            depth++
+        }
+        return null
+    }
+
+    private fun fail(msg: String) {
+        Log.e("KtxFlow", "실패: $msg")
+        Toast.makeText(applicationContext, msg, Toast.LENGTH_LONG).show()
+        removeKtxOverlay()
+    }
+
+    // ============================================
+    // 🌟 입력/응답 대기
+    // ============================================
+    private suspend fun waitForInput(): String? {
+        ktxInputDeferred = CompletableDeferred()
+        val result = ktxInputDeferred!!.await()
+        return if (result == "cancel") null else result
+    }
+
+    private suspend fun waitForTripType(): String {
+        ktxInputDeferred = CompletableDeferred()
+        return ktxInputDeferred!!.await()
+    }
+
+    private suspend fun waitForGuideAction(): String? {
+        ktxInputDeferred = CompletableDeferred()
+        val result = ktxInputDeferred!!.await()
+        return if (result == "cancel") null else result
+    }
+
+    // ============================================
+    // 🌟 안내 오버레이 (코레일톡 터치 가능)
+    // ============================================
+    private fun showKtxGuideOverlay(
+        message: String,
+        showHelpButton: Boolean = false,
+        topPosition: Boolean = false
+    ) {
+        removeKtxOverlay()
+        val ctx: Context = this
+
+        val wrapper = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor(THEME_BACKGROUND))
+            setPadding(dp(16f).toInt(), dp(12f).toInt(), dp(16f).toInt(), dp(16f).toInt())
+        }
+
+        val questionView = TextView(ctx).apply {
+            text = "🤖  $message"
+            setTextColor(Color.parseColor(TEXT_DARK))
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(BUBBLE_BOT_BG))
+                cornerRadius = dp(16f)
+            }
+            setPadding(dp(14f).toInt(), dp(12f).toInt(), dp(14f).toInt(), dp(12f).toInt())
+        }
+        wrapper.addView(questionView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        ktxQuestionView = questionView
+
+        val btnRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+
+        if (showHelpButton) {
+            val helpBtn = Button(ctx).apply {
+                text = "도움"
+                setTextColor(Color.parseColor(THEME_PURPLE))
+                typeface = Typeface.DEFAULT_BOLD
+                background = GradientDrawable().apply {
+                    setColor(Color.WHITE); cornerRadius = dp(16f)
+                    setStroke(dp(1.5f).toInt(), Color.parseColor(THEME_PURPLE))
+                }
+                stateListAnimator = null
+                setOnClickListener { ktxInputDeferred?.complete("help") }
+            }
+            btnRow.addView(helpBtn, LinearLayout.LayoutParams(0, dp(44f).toInt(), 1f).apply {
+                setMargins(dp(4f).toInt(), 0, dp(4f).toInt(), 0)
+            })
+        }
+
+        val cancelBtn = Button(ctx).apply {
+            text = "취소"
+            setTextColor(Color.parseColor(CANCEL_RED))
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE); cornerRadius = dp(16f)
+                setStroke(dp(1.5f).toInt(), Color.parseColor(CANCEL_RED))
+            }
+            stateListAnimator = null
+            setOnClickListener { ktxInputDeferred?.complete("cancel") }
+        }
+        btnRow.addView(cancelBtn, LinearLayout.LayoutParams(0, dp(44f).toInt(), 1f).apply {
+            setMargins(dp(4f).toInt(), 0, dp(4f).toInt(), 0)
+        })
+
+        wrapper.addView(btnRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(0, dp(10f).toInt(), 0, 0) })
+
+        val windowParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = if (topPosition) Gravity.TOP else Gravity.BOTTOM
+        }
+        overlayView = wrapper
+        windowManager?.addView(overlayView, windowParams)
+    }
+
+
+    // ============================================
+    // 🌟 좌석 선택 옵션 오버레이
+    // ============================================
+    private fun showKtxSeatOptionOverlay() {
+        removeKtxOverlay()
+        val ctx: Context = this
+
+        val wrapper = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor(THEME_BACKGROUND))
+            setPadding(dp(16f).toInt(), dp(12f).toInt(), dp(16f).toInt(), dp(16f).toInt())
+        }
+
+        val questionView = TextView(ctx).apply {
+            text = "🤖  선택하신 열차로 진행할게요!\n좌석은 어떻게 하시겠어요?"
+            setTextColor(Color.parseColor(TEXT_DARK))
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(BUBBLE_BOT_BG))
+                cornerRadius = dp(16f)
+            }
+            setPadding(dp(14f).toInt(), dp(12f).toInt(), dp(14f).toInt(), dp(12f).toInt())
+        }
+        wrapper.addView(questionView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        ktxQuestionView = questionView
+
+        val selectSeatBtn = Button(ctx).apply {
+            text = "🪑  좌석 선택하기"
+            setTextColor(Color.WHITE)
+            textSize = 17f
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(THEME_PURPLE)); cornerRadius = dp(24f)
+            }
+            stateListAnimator = null
+            setOnClickListener { ktxInputDeferred?.complete("select_seat") }
+        }
+        wrapper.addView(selectSeatBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(50f).toInt()
+        ).apply { setMargins(0, dp(12f).toInt(), 0, 0) })
+
+        val anySeatBtn = Button(ctx).apply {
+            text = "🎲  아무 좌석에 앉기"
+            setTextColor(Color.WHITE)
+            textSize = 17f
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(AUTO_GREEN)); cornerRadius = dp(24f)
+            }
+            stateListAnimator = null
+            setOnClickListener { ktxInputDeferred?.complete("any_seat") }
+        }
+        wrapper.addView(anySeatBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(50f).toInt()
+        ).apply { setMargins(0, dp(8f).toInt(), 0, 0) })
+
+        val cancelBtn = Button(ctx).apply {
+            text = "취소"
+            setTextColor(Color.parseColor(CANCEL_RED))
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE); cornerRadius = dp(16f)
+                setStroke(dp(1.5f).toInt(), Color.parseColor(CANCEL_RED))
+            }
+            stateListAnimator = null
+            setOnClickListener { ktxInputDeferred?.complete("cancel") }
+        }
+        wrapper.addView(cancelBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(44f).toInt()
+        ).apply { setMargins(0, dp(8f).toInt(), 0, 0) })
+
+        val windowParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.BOTTOM }
+        overlayView = wrapper
+        windowManager?.addView(overlayView, windowParams)
+    }
+
+    // ============================================
+    // 🌟 KTX 입력 팝업 (역 입력용)
+    // ============================================
+    private fun showKtxInputOverlay(initialQuestion: String) {
+        removeKtxOverlay()
+        val ctx: Context = this
+
+        val wrapper = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor(THEME_BACKGROUND))
+            setPadding(dp(16f).toInt(), dp(14f).toInt(), dp(16f).toInt(), dp(16f).toInt())
+        }
+
+        val questionView = TextView(ctx).apply {
+            text = "🤖  $initialQuestion"
+            setTextColor(Color.parseColor(TEXT_DARK))
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(BUBBLE_BOT_BG))
+                cornerRadius = dp(16f)
+            }
+            setPadding(dp(14f).toInt(), dp(12f).toInt(), dp(14f).toInt(), dp(12f).toInt())
+        }
+        wrapper.addView(questionView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        ktxQuestionView = questionView
+
+        val inputRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        ktxInputRow = inputRow
+
+        val micBtn = TextView(ctx).apply {
+            text = "🎤"; textSize = 18f; gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(THEME_PURPLE)); cornerRadius = dp(22f)
+            }
+            setOnClickListener { onKtxMicClick() }
+        }
+        ktxMicView = micBtn
+        inputRow.addView(micBtn, LinearLayout.LayoutParams(dp(40f).toInt(), dp(40f).toInt()))
+
+        val edit = EditText(ctx).apply {
+            hint = "입력 후 ↑"
+            setHintTextColor(Color.parseColor(TEXT_GRAY))
+            setTextColor(Color.parseColor(TEXT_DARK))
+            textSize = 14f
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE); cornerRadius = dp(20f)
+            }
+            setPadding(dp(14f).toInt(), dp(6f).toInt(), dp(14f).toInt(), dp(6f).toInt())
+            inputType = InputType.TYPE_CLASS_TEXT
+            imeOptions = EditorInfo.IME_ACTION_SEND
+            setOnEditorActionListener { _, actionId, _ ->
+                if (actionId == EditorInfo.IME_ACTION_SEND) { onKtxSendClick(); true } else false
+            }
+        }
+        ktxInputView = edit
+        inputRow.addView(edit, LinearLayout.LayoutParams(0, dp(40f).toInt(), 1f).apply {
+            setMargins(dp(8f).toInt(), 0, dp(8f).toInt(), 0)
+        })
+
+        val sendBtn = TextView(ctx).apply {
+            text = "↑"; setTextColor(Color.WHITE); textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(THEME_PURPLE)); cornerRadius = dp(22f)
+            }
+            setOnClickListener { onKtxSendClick() }
+        }
+        inputRow.addView(sendBtn, LinearLayout.LayoutParams(dp(40f).toInt(), dp(40f).toInt()))
+
+        wrapper.addView(inputRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(0, dp(10f).toInt(), 0, 0) })
+
+        val btnRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            visibility = View.GONE
+        }
+        ktxButtonRow = btnRow
+
+        val onewayBtn = Button(ctx).apply {
+            text = "편도"; setTextColor(Color.WHITE); textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(AUTO_GREEN)); cornerRadius = dp(22f)
+            }
+            stateListAnimator = null
+            setOnClickListener { ktxInputDeferred?.complete("oneway") }
+        }
+        val roundBtn = Button(ctx).apply {
+            text = "왕복"; setTextColor(Color.WHITE); textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(THEME_PURPLE)); cornerRadius = dp(22f)
+            }
+            stateListAnimator = null
+            setOnClickListener { ktxInputDeferred?.complete("round") }
+        }
+        val btnLp = LinearLayout.LayoutParams(0, dp(44f).toInt(), 1f).apply {
+            setMargins(dp(4f).toInt(), 0, dp(4f).toInt(), 0)
+        }
+        btnRow.addView(onewayBtn, btnLp)
+        btnRow.addView(roundBtn, btnLp)
+        wrapper.addView(btnRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(0, dp(10f).toInt(), 0, 0) })
+
+        val cancelBtn = Button(ctx).apply {
+            text = "취소"; setTextColor(Color.parseColor(CANCEL_RED))
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE); cornerRadius = dp(16f)
+                setStroke(dp(1.5f).toInt(), Color.parseColor(CANCEL_RED))
+            }
+            stateListAnimator = null
+            setOnClickListener { ktxInputDeferred?.complete("cancel") }
+        }
+        wrapper.addView(cancelBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(40f).toInt()
+        ).apply { setMargins(0, dp(8f).toInt(), 0, 0) })
+
+        val windowParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.BOTTOM }
+        overlayView = wrapper
+        windowManager?.addView(overlayView, windowParams)
+
+        wrapper.viewTreeObserver.addOnGlobalLayoutListener {
+            val view = overlayView ?: return@addOnGlobalLayoutListener
+            val rect = Rect()
+            view.getWindowVisibleDisplayFrame(rect)
+            val screenHeight = resources.displayMetrics.heightPixels
+            val keypadHeight = screenHeight - rect.bottom
+            val params = view.layoutParams as? WindowManager.LayoutParams ?: return@addOnGlobalLayoutListener
+            val targetY = if (keypadHeight > screenHeight * 0.15) keypadHeight else 0
+            if (params.y != targetY) {
+                params.y = targetY
+                try { windowManager?.updateViewLayout(view, params) } catch (_: Exception) {}
+            }
+        }
+    }
+
+    private fun updateKtxQuestion(question: String) {
+        ktxQuestionView?.text = "🤖  $question"
+        ktxInputView?.setText("")
+    }
+
+    private fun hideInputRow() {
+        try {
+            ktxInputRow?.visibility = View.GONE
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+            ktxInputView?.windowToken?.let { imm.hideSoftInputFromWindow(it, 0) }
+            ktxInputView?.clearFocus()
+        } catch (e: Exception) {
+            Log.e("KtxFlow", "hideInputRow 에러: ${e.message}")
+        }
+    }
+
+    private fun showInputRow() { ktxInputRow?.visibility = View.VISIBLE }
+    private fun showTripTypeButtons() {
+        ktxInputRow?.visibility = View.GONE
+        ktxButtonRow?.visibility = View.VISIBLE
+    }
+    private fun hideTripTypeButtons() { ktxButtonRow?.visibility = View.GONE }
+
+    private fun onKtxSendClick() {
+        val text = ktxInputView?.text?.toString()?.trim() ?: ""
+        if (text.isEmpty()) return
+        try {
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+            ktxInputView?.windowToken?.let { imm.hideSoftInputFromWindow(it, 0) }
+            ktxInputView?.clearFocus()
+        } catch (_: Exception) {}
+        ktxInputDeferred?.complete(text)
+    }
+
+    private fun onKtxMicClick() {
+        if (ktxIsListening) {
+            ktxRecognizer?.stopListening()
+            ktxIsListening = false; updateMicColor(); return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(this, "마이크 권한이 필요해요.", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            Toast.makeText(this, "음성 인식 미지원", Toast.LENGTH_SHORT).show()
+            return
+        }
+        startKtxListening()
+    }
+
+    private fun startKtxListening() {
+        ktxRecognizer?.destroy()
+        ktxRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR")
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        }
+        ktxRecognizer?.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) { ktxIsListening = true; updateMicColor() }
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() { ktxIsListening = false; updateMicColor() }
+            override fun onError(error: Int) {
+                ktxIsListening = false; updateMicColor()
+                Toast.makeText(this@AutoAgentService, "음성 인식 오류", Toast.LENGTH_SHORT).show()
+            }
+            override fun onResults(results: Bundle?) {
+                ktxIsListening = false; updateMicColor()
+                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                if (!matches.isNullOrEmpty()) {
+                    ktxInputView?.setText(matches[0])
+                    onKtxSendClick()
+                }
+            }
+            override fun onPartialResults(partialResults: Bundle?) {}
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        })
+        ktxRecognizer?.startListening(intent)
+    }
+
+    private fun updateMicColor() {
+        ktxMicView?.background = GradientDrawable().apply {
+            setColor(Color.parseColor(if (ktxIsListening) CANCEL_RED else THEME_PURPLE))
+            cornerRadius = dp(22f)
+        }
+    }
+
+    private fun removeKtxOverlay() {
+        overlayView?.let {
+            try { windowManager?.removeView(it) } catch (_: Exception) {}
+            overlayView = null
+        }
+        ktxQuestionView = null; ktxInputView = null; ktxMicView = null
+        ktxButtonRow = null; ktxInputRow = null
+        ktxRecognizer?.destroy(); ktxRecognizer = null
+    }
+
+    // ============================================
+    // 이하 쿠팡 자동화 (변경 없음)
+    // ============================================
+
     private fun runCoupangAutomation(query: String, autoMode: Boolean = false) {
         automationJob?.cancel()
         currentQuery = query
         automationJob = serviceScope.launch(Dispatchers.IO) {
-
             val encodedQuery = Uri.encode(query)
             val uri = Uri.parse("coupang://search?q=$encodedQuery")
             val launchIntent = Intent(Intent.ACTION_VIEW, uri).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            try {
-                startActivity(launchIntent)
-            } catch (e: Exception) {
-                val fallbackUri = Uri.parse("https://m.coupang.com/nm/search?q=$encodedQuery")
-                val fallbackIntent = Intent(Intent.ACTION_VIEW, fallbackUri).apply {
+            try { startActivity(launchIntent) }
+            catch (e: Exception) {
+                val fallback = Intent(Intent.ACTION_VIEW, Uri.parse("https://m.coupang.com/nm/search?q=$encodedQuery")).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
-                startActivity(fallbackIntent)
+                startActivity(fallback)
             }
 
-            var currentState = if (autoMode) {
-                AgentState.AUTO_WAIT_RESULTS
-            } else {
-                AgentState.WAIT_FOR_RESULTS_LOAD
-            }
+            var currentState = if (autoMode) AgentState.AUTO_WAIT_RESULTS else AgentState.WAIT_FOR_RESULTS_LOAD
             var stateWaitCount = 0
 
             for (i in 1..180) {
@@ -104,61 +1054,43 @@ class AutoAgentService : AccessibilityService() {
                 val allNodes = rootNode.findAllNodes()
 
                 when (currentState) {
-
                     AgentState.WAIT_FOR_RESULTS_LOAD -> {
                         val isLoaded = allNodes.any {
                             val t = it.text?.toString() ?: ""
                             t.contains("필터") || t.contains("원")
                         }
                         if (isLoaded && stateWaitCount > 2) {
-                            currentState = AgentState.WAIT_USER_PICK
-                            stateWaitCount = 0
-                        } else {
-                            stateWaitCount++
-                        }
+                            currentState = AgentState.WAIT_USER_PICK; stateWaitCount = 0
+                        } else stateWaitCount++
                     }
-
                     AgentState.WAIT_USER_PICK -> {
                         val action = showPickOverlayAndDetect()
                         when (action) {
                             "cancel" -> currentState = AgentState.CANCELLED
-                            "help" -> {
-                                withContext(Dispatchers.Main) {
-                                    Toast.makeText(applicationContext, "도움 기능은 준비 중입니다.", Toast.LENGTH_SHORT).show()
-                                }
+                            "help" -> withContext(Dispatchers.Main) {
+                                Toast.makeText(applicationContext, "도움 기능은 준비 중입니다.", Toast.LENGTH_SHORT).show()
                             }
                             "auto" -> {
                                 withContext(Dispatchers.Main) {
                                     Toast.makeText(applicationContext, "괜찮은 상품을 골라드릴게요...", Toast.LENGTH_SHORT).show()
                                 }
-                                currentState = AgentState.AUTO_CLICK_FIRST_ITEM
-                                stateWaitCount = 0
+                                currentState = AgentState.AUTO_CLICK_FIRST_ITEM; stateWaitCount = 0
                             }
-                            "detected" -> {
-                                currentState = AgentState.WAIT_USER_BUY_DECISION
-                                stateWaitCount = 0
-                            }
+                            "detected" -> { currentState = AgentState.WAIT_USER_BUY_DECISION; stateWaitCount = 0 }
                             else -> currentState = AgentState.CANCELLED
                         }
                     }
-
                     AgentState.WAIT_USER_BUY_DECISION -> {
                         val action = showBuyOverlay()
                         when (action) {
                             "cancel" -> currentState = AgentState.CANCELLED
-                            "help" -> {
-                                withContext(Dispatchers.Main) {
-                                    Toast.makeText(applicationContext, "도움 기능은 준비 중입니다.", Toast.LENGTH_SHORT).show()
-                                }
+                            "help" -> withContext(Dispatchers.Main) {
+                                Toast.makeText(applicationContext, "도움 기능은 준비 중입니다.", Toast.LENGTH_SHORT).show()
                             }
-                            "buy" -> {
-                                currentState = AgentState.CLICK_BUY_NOW
-                                stateWaitCount = 0
-                            }
+                            "buy" -> { currentState = AgentState.CLICK_BUY_NOW; stateWaitCount = 0 }
                             else -> currentState = AgentState.CANCELLED
                         }
                     }
-
                     AgentState.AUTO_WAIT_RESULTS -> {
                         val isLoaded = allNodes.any {
                             val t = it.text?.toString() ?: ""
@@ -168,20 +1100,13 @@ class AutoAgentService : AccessibilityService() {
                             withContext(Dispatchers.Main) {
                                 Toast.makeText(applicationContext, "괜찮은 상품을 골라드릴게요...", Toast.LENGTH_SHORT).show()
                             }
-                            currentState = AgentState.AUTO_CLICK_FIRST_ITEM
-                            stateWaitCount = 0
-                        } else {
-                            stateWaitCount++
-                        }
+                            currentState = AgentState.AUTO_CLICK_FIRST_ITEM; stateWaitCount = 0
+                        } else stateWaitCount++
                     }
-
                     AgentState.AUTO_CLICK_FIRST_ITEM -> {
                         val firstProduct = findFirstGoodProduct(allNodes)
-
                         if (firstProduct != null && firstProduct.performClickRecursive()) {
-                            delay(2500)
-                            currentState = AgentState.AUTO_WAIT_DETAIL
-                            stateWaitCount = 0
+                            delay(2500); currentState = AgentState.AUTO_WAIT_DETAIL; stateWaitCount = 0
                         } else {
                             stateWaitCount++
                             if (stateWaitCount > 5) {
@@ -192,21 +1117,17 @@ class AutoAgentService : AccessibilityService() {
                             }
                         }
                     }
-
                     AgentState.AUTO_WAIT_DETAIL -> {
                         val isDetail = allNodes.any {
                             val t = it.text?.toString() ?: ""
                             t.contains("바로구매") || t.contains("구매하기")
                         }
-                        if (isDetail) {
-                            currentState = AgentState.CLICK_BUY_NOW
-                            stateWaitCount = 0
-                        } else {
+                        if (isDetail) { currentState = AgentState.CLICK_BUY_NOW; stateWaitCount = 0 }
+                        else {
                             stateWaitCount++
                             if (stateWaitCount > 10) currentState = AgentState.CANCELLED
                         }
                     }
-
                     AgentState.CLICK_BUY_NOW -> {
                         val targetBuyBtn = allNodes.filter {
                             val t = it.text?.toString() ?: ""
@@ -215,55 +1136,39 @@ class AutoAgentService : AccessibilityService() {
                         }.maxByOrNull {
                             val rect = Rect(); it.getBoundsInScreen(rect); rect.top
                         }
-
                         if (targetBuyBtn?.performClickRecursive() == true) {
-                            delay(3000)
-                            currentState = AgentState.WAIT_FOR_PAYMENT_PAGE
-                            stateWaitCount = 0
+                            delay(3000); currentState = AgentState.WAIT_FOR_PAYMENT_PAGE; stateWaitCount = 0
                         } else {
                             stateWaitCount++
                             if (stateWaitCount > 5) currentState = AgentState.CANCELLED
                         }
                     }
-
                     AgentState.WAIT_FOR_PAYMENT_PAGE -> {
                         val payBtn = allNodes.find {
                             val t = it.text?.toString() ?: ""
                             val d = it.contentDescription?.toString() ?: ""
                             t.contains("결제하기") || t.contains("주문하기") || d.contains("결제하기")
                         }
-
                         if (payBtn != null) {
                             val price = extractPrice(allNodes)
                             val address = extractDeliveryAddress(allNodes)
                             val payment = extractPaymentMethod(allNodes)
-
                             val confirmed = showFinalConfirmOverlay(
-                                productName = currentQuery,
-                                price = price,
-                                address = address,
-                                payment = payment
+                                productName = currentQuery, price = price, address = address, payment = payment
                             )
-
-                            if (confirmed) {
-                                payBtn.performClickRecursive()
-                                currentState = AgentState.DONE
-                            } else {
-                                currentState = AgentState.CANCELLED
-                            }
+                            if (confirmed) { payBtn.performClickRecursive(); currentState = AgentState.DONE }
+                            else currentState = AgentState.CANCELLED
                         } else {
                             stateWaitCount++
                             if (stateWaitCount > 15) currentState = AgentState.CANCELLED
                         }
                     }
-
                     AgentState.DONE -> {
                         withContext(Dispatchers.Main) {
                             Toast.makeText(applicationContext, "결제를 진행했습니다!", Toast.LENGTH_SHORT).show()
                         }
                         return@launch
                     }
-
                     AgentState.CANCELLED -> {
                         withContext(Dispatchers.Main) {
                             removeOverlay()
@@ -276,7 +1181,6 @@ class AutoAgentService : AccessibilityService() {
                     }
                 }
             }
-
             withContext(Dispatchers.Main) {
                 removeOverlay()
                 Toast.makeText(applicationContext, "시간이 초과되었습니다.", Toast.LENGTH_SHORT).show()
@@ -289,16 +1193,10 @@ class AutoAgentService : AccessibilityService() {
             val t = node.text?.toString() ?: ""
             val d = node.contentDescription?.toString() ?: ""
             val combined = t + d
-
-            combined.length in 10..100 &&
-                    !combined.contains("광고") &&
-                    !combined.contains("Sponsored") &&
-                    !combined.contains("필터") &&
-                    !combined.contains("최근 검색") &&
-                    !combined.contains("카테고리") &&
-                    !combined.contains("장바구니")
+            combined.length in 10..100 && !combined.contains("광고") && !combined.contains("Sponsored") &&
+                    !combined.contains("필터") && !combined.contains("최근 검색") &&
+                    !combined.contains("카테고리") && !combined.contains("장바구니")
         }
-
         return candidates.minByOrNull {
             val rect = Rect(); it.getBoundsInScreen(rect); rect.top
         }
@@ -307,143 +1205,78 @@ class AutoAgentService : AccessibilityService() {
     private fun extractPrice(allNodes: List<AccessibilityNodeInfo>): String {
         val priceTexts = allNodes.mapNotNull { it.text?.toString() }
             .filter { it.contains("원") && it.any { ch -> ch.isDigit() } }
-
         val maxPrice = priceTexts.maxByOrNull {
             it.filter { ch -> ch.isDigit() }.toLongOrNull() ?: 0L
         }
-
         return maxPrice ?: "확인 불가"
     }
 
-    // ==========================================
-    // 🌟 라벨 아래/오른쪽의 후보 텍스트들을 모두 수집
-    // ==========================================
     private fun collectTextsNearLabel(
-        allNodes: List<AccessibilityNodeInfo>,
-        labelKeywords: List<String>
+        allNodes: List<AccessibilityNodeInfo>, labelKeywords: List<String>
     ): List<String> {
         val labelNode = allNodes.firstOrNull { node ->
             val t = node.text?.toString() ?: ""
-            (labelKeywords.any { keyword ->
-                t == keyword || t.startsWith(keyword)
-            }) && t.length < 15
+            (labelKeywords.any { k -> t == k || t.startsWith(k) }) && t.length < 15
         } ?: return emptyList()
-
         val labelRect = Rect()
         labelNode.getBoundsInScreen(labelRect)
-
         val candidates = allNodes.mapNotNull { node ->
             val t = node.text?.toString() ?: ""
             if (t.isBlank() || t == labelNode.text?.toString()) return@mapNotNull null
             if (labelKeywords.any { t == it }) return@mapNotNull null
-
             val rect = Rect()
             node.getBoundsInScreen(rect)
-
             val isRightOf = rect.left >= labelRect.right - 10 &&
                     Math.abs(rect.centerY() - labelRect.centerY()) < 50
             val isBelow = rect.top in (labelRect.bottom)..(labelRect.bottom + 400) &&
                     rect.left < labelRect.right + 200
-
             if (isRightOf || isBelow) {
-                val distance = if (isRightOf) {
-                    rect.left - labelRect.right
-                } else {
-                    rect.top - labelRect.bottom
-                }
+                val distance = if (isRightOf) rect.left - labelRect.right else rect.top - labelRect.bottom
                 Pair(t, distance)
             } else null
         }
-
         return candidates.sortedBy { it.second }.map { it.first }
     }
 
-    // ==========================================
-    // 🌟 배송지 추출: 실제 주소 패턴이 있는 텍스트 선택
-    // ==========================================
     private fun extractDeliveryAddress(allNodes: List<AccessibilityNodeInfo>): String {
-        val candidates = collectTextsNearLabel(
-            allNodes,
-            listOf("배송지", "받는사람", "받는 사람", "배송 주소", "주소")
-        )
-
-        Log.d("ExtractDebug", "배송지 후보들: $candidates")
-
+        val candidates = collectTextsNearLabel(allNodes, listOf("배송지", "받는사람", "받는 사람", "배송 주소", "주소"))
         val addressPattern = Regex(".*(시|도)\\s?.*(구|군|읍|면).*")
-
-        // 1순위: 한국 주소 패턴 매칭
         val realAddress = candidates.firstOrNull { text ->
-            addressPattern.containsMatchIn(text) &&
-                    text.length in 8..80 &&
-                    !text.contains("배송비") &&
-                    !text.contains("쿠폰")
+            addressPattern.containsMatchIn(text) && text.length in 8..80 &&
+                    !text.contains("배송비") && !text.contains("쿠폰")
         }
         if (realAddress != null) return realAddress
-
-        // 2순위: 번지수가 포함된 텍스트
         val withNumber = candidates.firstOrNull { text ->
-            text.length in 10..80 &&
-                    text.any { it.isDigit() } &&
-                    !text.contains("원") &&
-                    !text.contains("기본") &&
-                    !text.contains("배송지")
+            text.length in 10..80 && text.any { it.isDigit() } &&
+                    !text.contains("원") && !text.contains("기본") && !text.contains("배송지")
         }
         if (withNumber != null) return withNumber
-
         return candidates.firstOrNull() ?: "확인 불가"
     }
 
-    // ==========================================
-    // 🌟 결제수단 추출: 결제 관련 키워드가 있는 텍스트 선택
-    // ==========================================
     private fun extractPaymentMethod(allNodes: List<AccessibilityNodeInfo>): String {
-        val candidates = collectTextsNearLabel(
-            allNodes,
-            listOf("결제수단", "결제 수단", "결제방법", "결제 방법")
-        )
-
-        Log.d("ExtractDebug", "결제수단 후보들: $candidates")
-
-        val paymentKeywords = listOf(
-            "쿠페이", "카카오페이", "네이버페이", "토스",
-            "카드", "계좌", "휴대폰", "페이코",
-            "삼성페이", "애플페이", "현금", "페이"
-        )
-
-        // 1순위: 결제수단 키워드 포함된 짧은 텍스트
+        val candidates = collectTextsNearLabel(allNodes, listOf("결제수단", "결제 수단", "결제방법", "결제 방법"))
+        val paymentKeywords = listOf("쿠페이", "카카오페이", "네이버페이", "토스", "카드", "계좌", "휴대폰", "페이코",
+            "삼성페이", "애플페이", "현금", "페이")
         val realPayment = candidates.firstOrNull { text ->
-            text.length < 30 &&
-                    paymentKeywords.any { keyword -> text.contains(keyword) } &&
-                    !text.contains("결제하기") &&
-                    !text.contains("결제수단") &&
-                    !text.contains("결제금액") &&
-                    !text.contains("원")  // 가격 제외
+            text.length < 30 && paymentKeywords.any { k -> text.contains(k) } &&
+                    !text.contains("결제하기") && !text.contains("결제수단") &&
+                    !text.contains("결제금액") && !text.contains("원")
         }
         if (realPayment != null) return realPayment
-
-        // 🌟 폴백: 가격/금액 관련 텍스트는 절대 제외
         val safeFallback = candidates.firstOrNull { text ->
-            !text.contains("원") &&
-                    !text.contains("금액") &&
-                    !text.contains("결제하기") &&
-                    !text.contains("결제수단") &&
-                    !text.any { it.isDigit() } &&  // 숫자 없는 것만 (가격 차단)
-                    text.length in 2..30
+            !text.contains("원") && !text.contains("금액") && !text.contains("결제하기") &&
+                    !text.contains("결제수단") && !text.any { it.isDigit() } && text.length in 2..30
         }
         return safeFallback ?: "확인 불가"
     }
 
     private suspend fun showPickOverlayAndDetect(): String {
         userActionDeferred = CompletableDeferred()
-
         withContext(Dispatchers.Main) {
-            showChatOverlay(
-                message = "원하는 물품을 클릭해주세요",
-                showBigBuyButton = false,
-                showAutoButton = true
-            )
+            showChatOverlay(message = "원하는 물품을 클릭해주세요",
+                showBigBuyButton = false, showAutoButton = true)
         }
-
         val detectJob = serviceScope.launch(Dispatchers.IO) {
             while (isActive) {
                 delay(700)
@@ -455,98 +1288,64 @@ class AutoAgentService : AccessibilityService() {
                     (t.contains("바로구매") || t.contains("구매하기") ||
                             d.contains("바로구매") || d.contains("구매하기"))
                 }
-                if (isDetail) {
-                    userActionDeferred?.complete("detected")
-                    break
-                }
+                if (isDetail) { userActionDeferred?.complete("detected"); break }
             }
         }
-
         val result = userActionDeferred!!.await()
         detectJob.cancel()
-
         withContext(Dispatchers.Main) { removeOverlay() }
         return result
     }
 
     private suspend fun showBuyOverlay(): String {
         userActionDeferred = CompletableDeferred()
-
         withContext(Dispatchers.Main) {
-            showChatOverlay(
-                message = "상품 상세설명을 읽어보세요",
-                showBigBuyButton = true,
-                showAutoButton = false
-            )
+            showChatOverlay(message = "상품 상세설명을 읽어보세요",
+                showBigBuyButton = true, showAutoButton = false)
         }
-
         val result = userActionDeferred!!.await()
         withContext(Dispatchers.Main) { removeOverlay() }
         return result
     }
 
     private suspend fun showFinalConfirmOverlay(
-        productName: String,
-        price: String,
-        address: String,
-        payment: String
+        productName: String, price: String, address: String, payment: String
     ): Boolean {
         userActionDeferred = CompletableDeferred()
-
         withContext(Dispatchers.Main) {
             showFinalConfirmUI(productName, price, address, payment)
         }
-
         val result = userActionDeferred!!.await()
         withContext(Dispatchers.Main) { removeOverlay() }
         return result == "buy"
     }
 
-    private fun showFinalConfirmUI(
-        productName: String,
-        price: String,
-        address: String,
-        payment: String
-    ) {
+    private fun showFinalConfirmUI(productName: String, price: String, address: String, payment: String) {
         removeOverlay()
         val ctx: Context = this
-
         val wrapper = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor(THEME_BACKGROUND))
             setPadding(dp(16f).toInt(), dp(12f).toInt(), dp(16f).toInt(), dp(16f).toInt())
         }
-
         val titleBubble = TextView(ctx).apply {
             text = "🤖  마지막으로 확인해주세요!"
-            setTextColor(Color.parseColor(TEXT_DARK))
-            textSize = 16f
+            setTextColor(Color.parseColor(TEXT_DARK)); textSize = 16f
             typeface = Typeface.DEFAULT_BOLD
             background = GradientDrawable().apply {
-                setColor(Color.parseColor(BUBBLE_BOT_BG))
-                cornerRadius = dp(16f)
+                setColor(Color.parseColor(BUBBLE_BOT_BG)); cornerRadius = dp(16f)
             }
             setPadding(dp(14f).toInt(), dp(12f).toInt(), dp(14f).toInt(), dp(12f).toInt())
         }
-        val titleParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        )
-        wrapper.addView(titleBubble, titleParams)
-
+        wrapper.addView(titleBubble, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         val infoCard = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
-                setColor(Color.parseColor(BUBBLE_BOT_BG))
-                cornerRadius = dp(16f)
+                setColor(Color.parseColor(BUBBLE_BOT_BG)); cornerRadius = dp(16f)
             }
             setPadding(dp(16f).toInt(), dp(14f).toInt(), dp(16f).toInt(), dp(14f).toInt())
         }
-        val infoCardParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { setMargins(0, dp(8f).toInt(), 0, 0) }
-
         infoCard.addView(makeInfoRow("📦  상품", productName))
         infoCard.addView(makeDivider())
         infoCard.addView(makeInfoRow("💰  금액", price))
@@ -554,55 +1353,40 @@ class AutoAgentService : AccessibilityService() {
         infoCard.addView(makeInfoRow("🏠  배송지", address))
         infoCard.addView(makeDivider())
         infoCard.addView(makeInfoRow("💳  결제", payment))
-
-        wrapper.addView(infoCard, infoCardParams)
-
+        wrapper.addView(infoCard, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(0, dp(8f).toInt(), 0, 0) })
         val buyBtn = Button(ctx).apply {
-            text = "결제하기"
-            setTextColor(Color.WHITE)
-            textSize = 18f
+            text = "결제하기"; setTextColor(Color.WHITE); textSize = 18f
             typeface = Typeface.DEFAULT_BOLD
             background = GradientDrawable().apply {
-                setColor(Color.parseColor(THEME_PURPLE))
-                cornerRadius = dp(24f)
+                setColor(Color.parseColor(THEME_PURPLE)); cornerRadius = dp(24f)
             }
             stateListAnimator = null
             setOnClickListener { userActionDeferred?.complete("buy") }
         }
-        val buyParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(56f).toInt()
-        ).apply { setMargins(0, dp(12f).toInt(), 0, 0) }
-        wrapper.addView(buyBtn, buyParams)
-
+        wrapper.addView(buyBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(56f).toInt()
+        ).apply { setMargins(0, dp(12f).toInt(), 0, 0) })
         val cancelBtn = Button(ctx).apply {
-            text = "취소"
-            setTextColor(Color.parseColor(CANCEL_RED))
+            text = "취소"; setTextColor(Color.parseColor(CANCEL_RED))
             typeface = Typeface.DEFAULT_BOLD
             background = GradientDrawable().apply {
-                setColor(Color.WHITE)
-                cornerRadius = dp(16f)
+                setColor(Color.WHITE); cornerRadius = dp(16f)
                 setStroke(dp(1.5f).toInt(), Color.parseColor(CANCEL_RED))
             }
             stateListAnimator = null
             setOnClickListener { userActionDeferred?.complete("cancel") }
         }
-        val cancelParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(48f).toInt()
-        ).apply { setMargins(0, dp(8f).toInt(), 0, 0) }
-        wrapper.addView(cancelBtn, cancelParams)
-
+        wrapper.addView(cancelBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(48f).toInt()
+        ).apply { setMargins(0, dp(8f).toInt(), 0, 0) })
         val windowParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.BOTTOM
-        }
-
+        ).apply { gravity = Gravity.BOTTOM }
         overlayView = wrapper
         windowManager?.addView(overlayView, windowParams)
     }
@@ -613,170 +1397,107 @@ class AutoAgentService : AccessibilityService() {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(8f).toInt(), 0, dp(8f).toInt())
         }
-
-        val labelView = TextView(ctx).apply {
-            text = label
-            setTextColor(Color.parseColor(TEXT_GRAY))
-            textSize = 13f
-        }
-        row.addView(labelView)
-
-        val valueView = TextView(ctx).apply {
-            text = value
-            setTextColor(Color.parseColor(TEXT_DARK))
-            textSize = 16f
+        row.addView(TextView(ctx).apply {
+            text = label; setTextColor(Color.parseColor(TEXT_GRAY)); textSize = 13f
+        })
+        row.addView(TextView(ctx).apply {
+            text = value; setTextColor(Color.parseColor(TEXT_DARK)); textSize = 16f
             typeface = Typeface.DEFAULT_BOLD
             setPadding(0, dp(4f).toInt(), 0, 0)
-        }
-        row.addView(valueView)
-
+        })
         return row
     }
 
     private fun makeDivider(): View {
-        val ctx: Context = this
-        val divider = View(ctx).apply {
-            setBackgroundColor(Color.parseColor("#EEEEEE"))
-        }
-        val params = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(1f).toInt()
-        )
-        divider.layoutParams = params
+        val divider = View(this).apply { setBackgroundColor(Color.parseColor("#EEEEEE")) }
+        divider.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(1f).toInt())
         return divider
     }
 
-    private fun showChatOverlay(
-        message: String,
-        showBigBuyButton: Boolean,
-        showAutoButton: Boolean = false
-    ) {
+    private fun showChatOverlay(message: String, showBigBuyButton: Boolean, showAutoButton: Boolean = false) {
         removeOverlay()
-
         val ctx: Context = this
-
         val wrapper = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor(THEME_BACKGROUND))
             setPadding(dp(16f).toInt(), dp(12f).toInt(), dp(16f).toInt(), dp(16f).toInt())
         }
-
         val botBubble = TextView(ctx).apply {
-            text = "🤖  $message"
-            setTextColor(Color.parseColor(TEXT_DARK))
-            textSize = 15f
+            text = "🤖  $message"; setTextColor(Color.parseColor(TEXT_DARK)); textSize = 15f
             background = GradientDrawable().apply {
-                setColor(Color.parseColor(BUBBLE_BOT_BG))
-                cornerRadius = dp(16f)
+                setColor(Color.parseColor(BUBBLE_BOT_BG)); cornerRadius = dp(16f)
             }
             setPadding(dp(14f).toInt(), dp(12f).toInt(), dp(14f).toInt(), dp(12f).toInt())
         }
-        val bubbleParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        )
-        wrapper.addView(botBubble, bubbleParams)
+        wrapper.addView(botBubble, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         if (showAutoButton) {
             val autoBtn = Button(ctx).apply {
-                text = "🎁  아무거나 골라줘"
-                setTextColor(Color.WHITE)
-                textSize = 17f
+                text = "🎁  아무거나 골라줘"; setTextColor(Color.WHITE); textSize = 17f
                 typeface = Typeface.DEFAULT_BOLD
                 background = GradientDrawable().apply {
-                    setColor(Color.parseColor(AUTO_GREEN))
-                    cornerRadius = dp(24f)
+                    setColor(Color.parseColor(AUTO_GREEN)); cornerRadius = dp(24f)
                 }
                 stateListAnimator = null
             }
-            autoBtn.setOnClickListener {
-                userActionDeferred?.complete("auto")
-            }
-            val autoParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(50f).toInt()
-            ).apply { setMargins(0, dp(12f).toInt(), 0, 0) }
-            wrapper.addView(autoBtn, autoParams)
+            autoBtn.setOnClickListener { userActionDeferred?.complete("auto") }
+            wrapper.addView(autoBtn, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(50f).toInt()
+            ).apply { setMargins(0, dp(12f).toInt(), 0, 0) })
         }
-
         if (showBigBuyButton) {
             val buyBtn = Button(ctx).apply {
-                text = "구매하기"
-                setTextColor(Color.WHITE)
-                textSize = 18f
+                text = "구매하기"; setTextColor(Color.WHITE); textSize = 18f
                 typeface = Typeface.DEFAULT_BOLD
                 background = GradientDrawable().apply {
-                    setColor(Color.parseColor(THEME_PURPLE))
-                    cornerRadius = dp(24f)
+                    setColor(Color.parseColor(THEME_PURPLE)); cornerRadius = dp(24f)
                 }
                 stateListAnimator = null
             }
-            buyBtn.setOnClickListener {
-                userActionDeferred?.complete("buy")
-            }
-            val buyParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(52f).toInt()
-            ).apply { setMargins(0, dp(12f).toInt(), 0, 0) }
-            wrapper.addView(buyBtn, buyParams)
+            buyBtn.setOnClickListener { userActionDeferred?.complete("buy") }
+            wrapper.addView(buyBtn, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(52f).toInt()
+            ).apply { setMargins(0, dp(12f).toInt(), 0, 0) })
         }
 
-        val btnRow = LinearLayout(ctx).apply {
-            orientation = LinearLayout.HORIZONTAL
-            val rowParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, dp(10f).toInt(), 0, 0) }
-            layoutParams = rowParams
-        }
-
+        val btnRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
         val cancelBtn = Button(ctx).apply {
-            text = "취소"
-            setTextColor(Color.parseColor(CANCEL_RED))
+            text = "취소"; setTextColor(Color.parseColor(CANCEL_RED))
             typeface = Typeface.DEFAULT_BOLD
             background = GradientDrawable().apply {
-                setColor(Color.WHITE)
-                cornerRadius = dp(16f)
+                setColor(Color.WHITE); cornerRadius = dp(16f)
                 setStroke(dp(1.5f).toInt(), Color.parseColor(CANCEL_RED))
             }
             stateListAnimator = null
         }
-        cancelBtn.setOnClickListener {
-            userActionDeferred?.complete("cancel")
-        }
-
+        cancelBtn.setOnClickListener { userActionDeferred?.complete("cancel") }
         val helpBtn = Button(ctx).apply {
-            text = "도움"
-            setTextColor(Color.parseColor(THEME_PURPLE))
+            text = "도움"; setTextColor(Color.parseColor(THEME_PURPLE))
             typeface = Typeface.DEFAULT_BOLD
             background = GradientDrawable().apply {
-                setColor(Color.WHITE)
-                cornerRadius = dp(16f)
+                setColor(Color.WHITE); cornerRadius = dp(16f)
                 setStroke(dp(1.5f).toInt(), Color.parseColor(THEME_PURPLE))
             }
             stateListAnimator = null
         }
-        helpBtn.setOnClickListener {
-            userActionDeferred?.complete("help")
-        }
-
+        helpBtn.setOnClickListener { userActionDeferred?.complete("help") }
         val btnParams = LinearLayout.LayoutParams(0, dp(44f).toInt(), 1f).apply {
             setMargins(dp(4f).toInt(), 0, dp(4f).toInt(), 0)
         }
         btnRow.addView(cancelBtn, btnParams)
         btnRow.addView(helpBtn, btnParams)
-        wrapper.addView(btnRow)
+        wrapper.addView(btnRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(0, dp(10f).toInt(), 0, 0) })
 
         val windowParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.BOTTOM
-        }
-
+        ).apply { gravity = Gravity.BOTTOM }
         overlayView = wrapper
         windowManager?.addView(overlayView, windowParams)
     }
@@ -813,7 +1534,7 @@ class AutoAgentService : AccessibilityService() {
 
     override fun onInterrupt() {
         serviceScope.launch(Dispatchers.Main) {
-            removeOverlay()
+            removeOverlay(); removeKtxOverlay()
         }
     }
 }
