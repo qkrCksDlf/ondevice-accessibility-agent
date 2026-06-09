@@ -2,14 +2,17 @@ package com.example.helpagent
 
 import android.Manifest
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityService.GestureResultCallback
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.accessibilityservice.GestureDescription
 import android.net.Uri
 import android.os.Bundle
 import android.speech.RecognitionListener
@@ -209,6 +212,123 @@ class AutoAgentService : AccessibilityService() {
     }
 
     // ============================================
+    // 🌟 텍스트로 버튼 클릭 (정확 일치 → 부분 일치)
+    // ============================================
+    private fun clickByText(vararg texts: String): Boolean {
+        val root = getKorailRoot() ?: return false
+        val allNodes = root.findAllNodes()
+        for (target in texts) {
+            val exact = allNodes.firstOrNull {
+                it.text?.toString()?.trim() == target ||
+                        it.contentDescription?.toString()?.trim() == target
+            }
+            if (exact != null && exact.performClickRecursive()) {
+                Log.d("KtxFlow", "clickByText 정확 '$target' 성공")
+                return true
+            }
+            val partial = allNodes.firstOrNull {
+                it.text?.toString()?.contains(target) == true ||
+                        it.contentDescription?.toString()?.contains(target) == true
+            }
+            if (partial != null && partial.performClickRecursive()) {
+                Log.d("KtxFlow", "clickByText 부분 '$target' 성공")
+                return true
+            }
+        }
+        Log.w("KtxFlow", "clickByText 실패: ${texts.joinToString()}")
+        return false
+    }
+
+    // ============================================
+    // 🌟 마일리지 잔액 추출
+    // ============================================
+    private fun extractMileage(): Int {
+        val root = getKorailRoot() ?: return 0
+
+        // 1) 전용 ID 우선 (가장 정확) — 잔액은 tv_ktx_mileage_total 에 따로 들어있음
+        root.findAccessibilityNodeInfosByViewId("com.korail.talk:id/tv_ktx_mileage_total")
+            .firstOrNull()?.text?.toString()?.let { raw ->
+                val num = raw.replace(",", "").filter { it.isDigit() }
+                if (num.isNotEmpty()) num.toIntOrNull()?.let {
+                    Log.d("KtxFlow", "마일리지 (ID): $it ('$raw')")
+                    return it
+                }
+            }
+
+        val allNodes = root.findAllNodes()
+
+        // 2) fallback: "마일리지" 가 들어간 텍스트 안에서 숫자 추출
+        val mileageTexts = allNodes.mapNotNull { it.text?.toString() }
+            .filter { it.contains("마일리지") }
+        for (t in mileageTexts) {
+            val num = t.replace(",", "").filter { it.isDigit() }
+            if (num.isNotEmpty()) num.toIntOrNull()?.let {
+                Log.d("KtxFlow", "마일리지 (동일 노드): $it ('$t')")
+                return it
+            }
+        }
+        // "마일리지" 라벨 근처 숫자 노드에서 추출
+        val nearby = collectTextsNearLabel(allNodes, listOf("마일리지"))
+        for (t in nearby) {
+            val num = t.replace(",", "").replace("점", "").trim().filter { it.isDigit() }
+            if (num.isNotEmpty()) num.toIntOrNull()?.let {
+                Log.d("KtxFlow", "마일리지 (근처 노드): $it ('$t')")
+                return it
+            }
+        }
+        Log.d("KtxFlow", "마일리지 못 찾음 → 0")
+        return 0
+    }
+
+    // ============================================
+    // 🌟 화면 맨 아래로 스크롤
+    // ============================================
+    private suspend fun scrollToBottom() {
+        for (i in 1..10) {
+            val root = getKorailRoot() ?: break
+            val scrollable = root.findAllNodes().firstOrNull { it.isScrollable } ?: break
+            val scrolled = scrollable.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+            Log.d("KtxFlow", "scrollToBottom #$i: $scrolled")
+            if (!scrolled) break
+            delay(400)
+        }
+    }
+
+    // ============================================
+    // 🌟 코레일톡 시작 팝업 닫기
+    // ============================================
+    private fun dismissKorailStartPopup(): Boolean {
+        val root = getKorailRoot() ?: return false
+        val allNodes = root.findAllNodes()
+
+        // 팝업 감지: "오늘 그만 보기" 또는 "닫기" 가 화면에 있는지
+        val hasPopup = allNodes.any {
+            val t = it.text?.toString() ?: ""
+            val d = it.contentDescription?.toString() ?: ""
+            t.contains("오늘 그만") || d.contains("오늘 그만") ||
+                    t.trim() == "닫기" || d.trim() == "닫기"
+        }
+        if (!hasPopup) {
+            Log.d("KtxFlow", "시작 팝업 없음 → 출발역 진행")
+            return false
+        }
+
+        // "닫기" 버튼 클릭
+        val closeNode = allNodes.firstOrNull {
+            val t = it.text?.toString()?.trim() ?: ""
+            val d = it.contentDescription?.toString()?.trim() ?: ""
+            t == "닫기" || d == "닫기"
+        }
+        if (closeNode == null) {
+            Log.w("KtxFlow", "팝업 감지됨, '닫기' 버튼 못 찾음")
+            return false
+        }
+        val ok = closeNode.performClickRecursive()
+        Log.d("KtxFlow", "시작 팝업 '닫기' 클릭: $ok")
+        return ok
+    }
+
+    // ============================================
     // 🌟 KTX 전체 흐름
     // ============================================
     private fun runKtxFlow() {
@@ -228,6 +348,16 @@ class AutoAgentService : AccessibilityService() {
             try {
                 delay(2500)
                 debugDumpScreen("코레일톡 메인 진입")
+
+                // ===== 0) 시작 팝업 닫기 =====
+                delay(1000)
+                for (i in 1..3) {
+                    if (dismissKorailStartPopup()) {
+                        delay(800)        // 팝업 닫힌 뒤 화면 안정화
+                        break
+                    }
+                    delay(500)            // 팝업이 살짝 늦게 뜰 수 있어 잠깐 더 보고 재확인
+                }
 
                 // ===== 1) 출발역 =====
                 showKtxInputOverlay("출발역을 입력해주세요\n(예: 서울, 대전, 부산)")
@@ -461,26 +591,90 @@ class AutoAgentService : AccessibilityService() {
                     debugDumpScreen("좌석 선택 후 화면")
                 }
 
-                // ===== 7) 예매하기/결제 버튼 자동 클릭 =====
-                Toast.makeText(applicationContext, "예매를 진행할게요...", Toast.LENGTH_SHORT).show()
+                // ===== 7) 예매하기 클릭 → 결제 화면 진입 =====
+                Toast.makeText(applicationContext, "결제 화면으로 이동할게요...", Toast.LENGTH_SHORT).show()
                 delay(500)
 
                 val reserveBtn = findExactText("예매하기")?.let { findClickableAncestor(it) }
                     ?: findExactText("예매")?.let { findClickableAncestor(it) }
-                    ?: findExactText("결제하기")?.let { findClickableAncestor(it) }
-
                 if (reserveBtn != null) {
                     reserveBtn.performClickRecursive()
-                    Log.d("KtxFlow", "예매/결제 버튼 클릭")
-                    delay(2000)
-                    debugDumpScreen("예매 후 최종 화면")
-                    Toast.makeText(applicationContext, "예매를 진행했습니다!", Toast.LENGTH_LONG).show()
+                    Log.d("KtxFlow", "예매하기 버튼 클릭")
+                    delay(2500)
                 } else {
-                    Log.w("KtxFlow", "예매 버튼 못 찾음")
-                    Toast.makeText(applicationContext,
-                        "예매 버튼을 직접 눌러주세요",
-                        Toast.LENGTH_LONG).show()
+                    Log.w("KtxFlow", "예매하기 버튼 못 찾음 (이미 결제화면일 수도)")
                 }
+                debugDumpScreen("결제 화면 진입")
+
+                // ===== 8) 결제하기 버튼 클릭 =====
+                if (!(clickById("com.korail.talk:id/btn_reservation_confirm_right") || clickByText("결제하기"))) {
+                    fail("결제하기 버튼 못 찾음")
+                    return@launch
+                }
+                delay(2500)
+                debugDumpScreen("결제 정보 확인 화면")
+
+                // ===== 9) 결제 정보 확인 오버레이 =====
+                showKtxConfirmOverlay(
+                    "코레일톡 화면에 예매 정보가 나와 있어요.\n" +
+                            "출발·도착역, 날짜, 시간, 인원, 금액이\n" +
+                            "맞는지 꼭 확인해주세요!"
+                )
+                if (waitForGuideAction() == null) {
+                    Log.d("KtxFlow", "결제 정보 확인에서 취소함")
+                    removeKtxOverlay()
+                    return@launch
+                }
+                removeKtxOverlay()
+                delay(500)
+
+                // ===== 10) 다음 버튼 =====
+                if (!clickByText("다음")) {
+                    fail("다음 버튼 못 찾음")
+                    return@launch
+                }
+                delay(2000)
+                debugDumpScreen("마일리지/결제수단 화면")
+
+                // ===== 11) 마일리지 처리 =====
+                val mileage = extractMileage()
+                Log.d("KtxFlow", "감지된 마일리지: $mileage")
+                if (mileage >= 100) {
+                    showKtxMileageOverlay(
+                        "쌓인 마일리지가 ${mileage}점 있어요.\n이번 결제에 사용할까요?"
+                    )
+                    val mileageResult = waitForGuideAction()   // null=취소, "use", "skip"
+                    removeKtxOverlay()
+                    delay(500)
+                    if (mileageResult == null) {
+                        Log.d("KtxFlow", "마일리지 단계에서 취소함")
+                        return@launch
+                    }
+                    if (mileageResult == "use") {
+                        val useClicked = clickById("com.korail.talk:id/ktx_use_button") || clickByText("사용")
+                        if (useClicked) {
+                            delay(1500)
+                            debugDumpScreen("마일리지 사용 클릭 후")   // 전액적용 버튼 ID/문구 확인용
+                            if (!clickByText("전액적용", "전액 적용", "전액")) {
+                                Log.w("KtxFlow", "전액적용 버튼 못 찾음 (위 덤프 확인 필요)")
+                            }
+                            delay(1200)
+                            Log.d("KtxFlow", "마일리지 전액적용 시도 완료")
+                        } else {
+                            Log.w("KtxFlow", "마일리지 '사용' 버튼 못 찾음 — 건너뜀")
+                        }
+                    }
+                }
+
+                // ===== 12) 맨 아래로 스크롤 =====
+                delay(500)
+                scrollToBottom()
+                delay(800)
+                debugDumpScreen("결제 직전 최종 화면")
+
+                // ===== 13) 최종 안내 (3초 후 자동 제거) =====
+                showKtxDoneOverlay()
+                delay(3000)
                 removeKtxOverlay()
 
             } catch (e: Exception) {
@@ -758,6 +952,196 @@ class AutoAgentService : AccessibilityService() {
         wrapper.addView(cancelBtn, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, dp(44f).toInt()
         ).apply { setMargins(0, dp(8f).toInt(), 0, 0) })
+
+        val windowParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.BOTTOM }
+        overlayView = wrapper
+        windowManager?.addView(overlayView, windowParams)
+    }
+
+    // ============================================
+    // 🌟 결제 정보 확인 오버레이 (네 / 취소)
+    // ============================================
+    private fun showKtxConfirmOverlay(message: String) {
+        removeKtxOverlay()
+        val ctx: Context = this
+
+        val wrapper = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor(THEME_BACKGROUND))
+            setPadding(dp(16f).toInt(), dp(12f).toInt(), dp(16f).toInt(), dp(16f).toInt())
+        }
+
+        val questionView = TextView(ctx).apply {
+            text = "🤖  $message"
+            setTextColor(Color.parseColor(TEXT_DARK))
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(BUBBLE_BOT_BG))
+                cornerRadius = dp(16f)
+            }
+            setPadding(dp(14f).toInt(), dp(12f).toInt(), dp(14f).toInt(), dp(12f).toInt())
+        }
+        wrapper.addView(questionView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        ktxQuestionView = questionView
+
+        val confirmBtn = Button(ctx).apply {
+            text = "✓  네, 맞아요"
+            setTextColor(Color.WHITE); textSize = 17f
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(THEME_PURPLE)); cornerRadius = dp(24f)
+            }
+            stateListAnimator = null
+            setOnClickListener { ktxInputDeferred?.complete("confirm") }
+        }
+        wrapper.addView(confirmBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(52f).toInt()
+        ).apply { setMargins(0, dp(12f).toInt(), 0, 0) })
+
+        val cancelBtn = Button(ctx).apply {
+            text = "취소"; setTextColor(Color.parseColor(CANCEL_RED))
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE); cornerRadius = dp(16f)
+                setStroke(dp(1.5f).toInt(), Color.parseColor(CANCEL_RED))
+            }
+            stateListAnimator = null
+            setOnClickListener { ktxInputDeferred?.complete("cancel") }
+        }
+        wrapper.addView(cancelBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(44f).toInt()
+        ).apply { setMargins(0, dp(8f).toInt(), 0, 0) })
+
+        val windowParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.BOTTOM }
+        overlayView = wrapper
+        windowManager?.addView(overlayView, windowParams)
+    }
+
+    // ============================================
+    // 🌟 마일리지 사용 여부 오버레이 (사용 / 그냥결제 / 취소)
+    // ============================================
+    private fun showKtxMileageOverlay(message: String) {
+        removeKtxOverlay()
+        val ctx: Context = this
+
+        val wrapper = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor(THEME_BACKGROUND))
+            setPadding(dp(16f).toInt(), dp(12f).toInt(), dp(16f).toInt(), dp(16f).toInt())
+        }
+
+        val questionView = TextView(ctx).apply {
+            text = "🤖  $message"
+            setTextColor(Color.parseColor(TEXT_DARK)); textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(BUBBLE_BOT_BG)); cornerRadius = dp(16f)
+            }
+            setPadding(dp(14f).toInt(), dp(12f).toInt(), dp(14f).toInt(), dp(12f).toInt())
+        }
+        wrapper.addView(questionView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        ktxQuestionView = questionView
+
+        val useBtn = Button(ctx).apply {
+            text = "💰  네, 사용할게요"
+            setTextColor(Color.WHITE); textSize = 17f
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(AUTO_GREEN)); cornerRadius = dp(24f)
+            }
+            stateListAnimator = null
+            setOnClickListener { ktxInputDeferred?.complete("use") }
+        }
+        wrapper.addView(useBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(50f).toInt()
+        ).apply { setMargins(0, dp(12f).toInt(), 0, 0) })
+
+        val skipBtn = Button(ctx).apply {
+            text = "아니요, 그냥 결제할게요"
+            setTextColor(Color.parseColor(THEME_PURPLE)); textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE); cornerRadius = dp(24f)
+                setStroke(dp(1.5f).toInt(), Color.parseColor(THEME_PURPLE))
+            }
+            stateListAnimator = null
+            setOnClickListener { ktxInputDeferred?.complete("skip") }
+        }
+        wrapper.addView(skipBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(48f).toInt()
+        ).apply { setMargins(0, dp(8f).toInt(), 0, 0) })
+
+        val cancelBtn = Button(ctx).apply {
+            text = "취소"; setTextColor(Color.parseColor(CANCEL_RED))
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE); cornerRadius = dp(16f)
+                setStroke(dp(1.5f).toInt(), Color.parseColor(CANCEL_RED))
+            }
+            stateListAnimator = null
+            setOnClickListener { ktxInputDeferred?.complete("cancel") }
+        }
+        wrapper.addView(cancelBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(44f).toInt()
+        ).apply { setMargins(0, dp(8f).toInt(), 0, 0) })
+
+        val windowParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.BOTTOM }
+        overlayView = wrapper
+        windowManager?.addView(overlayView, windowParams)
+    }
+
+    // ============================================
+    // 🌟 최종 안내 오버레이 (버튼 없음, 자동 제거)
+    // ============================================
+    private fun showKtxDoneOverlay() {
+        removeKtxOverlay()
+        val ctx: Context = this
+
+        val wrapper = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor(THEME_BACKGROUND))
+            setPadding(dp(16f).toInt(), dp(16f).toInt(), dp(16f).toInt(), dp(16f).toInt())
+        }
+
+        val questionView = TextView(ctx).apply {
+            text = "🤖  거의 다 됐어요!\n결제 수단을 고르고\n맨 아래 '결제/발권' 버튼을 누르시면 완료됩니다!"
+            setTextColor(Color.parseColor(TEXT_DARK)); textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(BUBBLE_BOT_BG)); cornerRadius = dp(16f)
+            }
+            setPadding(dp(14f).toInt(), dp(14f).toInt(), dp(14f).toInt(), dp(14f).toInt())
+        }
+        wrapper.addView(questionView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        ktxQuestionView = questionView
 
         val windowParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -1144,20 +1528,37 @@ class AutoAgentService : AccessibilityService() {
                         }
                     }
                     AgentState.WAIT_FOR_PAYMENT_PAGE -> {
+                        // 결제 버튼(클릭형) 또는 "밀어서 결제"(슬라이드형) 둘 다 감지
                         val payBtn = allNodes.find {
                             val t = it.text?.toString() ?: ""
                             val d = it.contentDescription?.toString() ?: ""
                             t.contains("결제하기") || t.contains("주문하기") || d.contains("결제하기")
                         }
-                        if (payBtn != null) {
+                        val slider = allNodes.find {
+                            val t = it.text?.toString() ?: ""
+                            val d = it.contentDescription?.toString() ?: ""
+                            t.contains("밀어") || d.contains("밀어")
+                        }
+                        if (payBtn != null || slider != null) {
                             val price = extractPrice(allNodes)
                             val address = extractDeliveryAddress(allNodes)
                             val payment = extractPaymentMethod(allNodes)
                             val confirmed = showFinalConfirmOverlay(
                                 productName = currentQuery, price = price, address = address, payment = payment
                             )
-                            if (confirmed) { payBtn.performClickRecursive(); currentState = AgentState.DONE }
-                            else currentState = AgentState.CANCELLED
+                            if (confirmed) {
+                                // 🌟 "밀어서 결제" 슬라이더가 있으면 swipe, 아니면 기존 클릭
+                                val acted = if (slider != null) {
+                                    val ok = slideToPay(allNodes)
+                                    if (!ok) payBtn?.performClickRecursive() ?: false else true
+                                } else {
+                                    payBtn?.performClickRecursive() ?: false
+                                }
+                                Log.d("Coupang", "결제 실행: $acted (slider=${slider != null})")
+                                currentState = AgentState.DONE
+                            } else {
+                                currentState = AgentState.CANCELLED
+                            }
                         } else {
                             stateWaitCount++
                             if (stateWaitCount > 15) currentState = AgentState.CANCELLED
@@ -1239,36 +1640,54 @@ class AutoAgentService : AccessibilityService() {
     }
 
     private fun extractDeliveryAddress(allNodes: List<AccessibilityNodeInfo>): String {
+        val allTexts = allNodes.mapNotNull { it.text?.toString()?.trim() }.filter { it.isNotBlank() }
+
+        // 🌟 한국 주소 패턴 직접 매칭 (라벨 위치에 의존하지 않음)
+        //    "인천광역시 미추홀구 ...", "서울특별시 강남구 ...", "경기도 ○○시 ..." 등
+        val addrRegex = Regex("(특별시|광역시|특별자치시|특별자치도|[가-힣]+도|[가-힣]+시)\\s*[가-힣]+(구|군|시|읍|면)")
+        val byPattern = allTexts.firstOrNull { t ->
+            addrRegex.containsMatchIn(t) && t.length in 6..90 &&
+                    !t.contains("배송비") && !t.contains("쿠폰") && !t.contains("원")
+        }
+        if (byPattern != null) return byPattern
+
+        // fallback: 기존 라벨 근처 방식
         val candidates = collectTextsNearLabel(allNodes, listOf("배송지", "받는사람", "받는 사람", "배송 주소", "주소"))
-        val addressPattern = Regex(".*(시|도)\\s?.*(구|군|읍|면).*")
         val realAddress = candidates.firstOrNull { text ->
-            addressPattern.containsMatchIn(text) && text.length in 8..80 &&
+            addrRegex.containsMatchIn(text) && text.length in 6..90 &&
                     !text.contains("배송비") && !text.contains("쿠폰")
         }
-        if (realAddress != null) return realAddress
-        val withNumber = candidates.firstOrNull { text ->
-            text.length in 10..80 && text.any { it.isDigit() } &&
-                    !text.contains("원") && !text.contains("기본") && !text.contains("배송지")
-        }
-        if (withNumber != null) return withNumber
-        return candidates.firstOrNull() ?: "확인 불가"
+        return realAddress ?: candidates.firstOrNull() ?: "확인 불가"
     }
 
     private fun extractPaymentMethod(allNodes: List<AccessibilityNodeInfo>): String {
+        val allTexts = allNodes.mapNotNull { it.text?.toString()?.trim() }.filter { it.isNotBlank() }
+
+        // 🌟 결제수단 직접 매칭
+        //    1순위: "농협은행 / ****9943" 처럼 은행/카드명 + 마스킹 숫자
+        val maskedRegex = Regex("\\*{2,}\\d{2,}")   // ****9943
+        val byMasked = allTexts.firstOrNull { t ->
+            t.length < 40 && maskedRegex.containsMatchIn(t) &&
+                    !t.contains("원") && !t.contains("소득공제") && !t.contains("현금영수증")
+        }
+        if (byMasked != null) return byMasked
+
+        // 2순위: 결제수단 키워드가 들어간 짧은 텍스트
+        val paymentKeywords = listOf("쿠페이", "카카오페이", "네이버페이", "토스", "카드", "계좌이체",
+            "무통장", "은행", "휴대폰", "페이코", "삼성페이", "애플페이", "페이")
+        val byKeyword = allTexts.firstOrNull { t ->
+            t.length < 30 && paymentKeywords.any { k -> t.contains(k) } &&
+                    !t.contains("결제하기") && !t.contains("결제수단") &&
+                    !t.contains("결제금액") && !t.contains("원") && !t.contains("동의")
+        }
+        if (byKeyword != null) return byKeyword
+
+        // fallback: 기존 라벨 근처 방식
         val candidates = collectTextsNearLabel(allNodes, listOf("결제수단", "결제 수단", "결제방법", "결제 방법"))
-        val paymentKeywords = listOf("쿠페이", "카카오페이", "네이버페이", "토스", "카드", "계좌", "휴대폰", "페이코",
-            "삼성페이", "애플페이", "현금", "페이")
-        val realPayment = candidates.firstOrNull { text ->
-            text.length < 30 && paymentKeywords.any { k -> text.contains(k) } &&
-                    !text.contains("결제하기") && !text.contains("결제수단") &&
-                    !text.contains("결제금액") && !text.contains("원")
-        }
-        if (realPayment != null) return realPayment
-        val safeFallback = candidates.firstOrNull { text ->
+        return candidates.firstOrNull { text ->
             !text.contains("원") && !text.contains("금액") && !text.contains("결제하기") &&
-                    !text.contains("결제수단") && !text.any { it.isDigit() } && text.length in 2..30
-        }
-        return safeFallback ?: "확인 불가"
+                    text.length in 2..30
+        } ?: "확인 불가"
     }
 
     private suspend fun showPickOverlayAndDetect(): String {
@@ -1528,6 +1947,55 @@ class AutoAgentService : AccessibilityService() {
             depth++
         }
         return target?.performAction(AccessibilityNodeInfo.ACTION_CLICK) ?: false
+    }
+
+    // ============================================
+    // 🌟 "밀어서 결제" 슬라이드 제스처
+    // ============================================
+    // 주어진 영역(rect)을 좌→우로 쓸어준다. (슬라이더 trackThumb 이동)
+    private fun swipeRight(rect: Rect, durationMs: Long = 600L): Boolean {
+        return try {
+            // 시작점은 트랙 왼쪽 안쪽, 끝점은 화면 오른쪽 끝(살짝 안쪽)까지 확실히 민다
+            val screenWidth = resources.displayMetrics.widthPixels
+            val y = rect.centerY().toFloat()
+            val startX = (rect.left + rect.width() * 0.12f)
+            val endX = (screenWidth - 8f)
+
+            val path = Path().apply {
+                moveTo(startX, y)
+                lineTo(endX, y)
+            }
+            val stroke = GestureDescription.StrokeDescription(path, 0, durationMs)
+            val gesture = GestureDescription.Builder().addStroke(stroke).build()
+
+            val done = CompletableDeferred<Boolean>()
+            val ok = dispatchGesture(gesture, object : GestureResultCallback() {
+                override fun onCompleted(d: GestureDescription?) { done.complete(true) }
+                override fun onCancelled(d: GestureDescription?) { done.complete(false) }
+            }, null)
+            Log.d("Coupang", "swipeRight dispatch=$ok rect=$rect ($startX→$endX, y=$y, screenW=$screenWidth)")
+            ok
+        } catch (e: Exception) {
+            Log.e("Coupang", "swipeRight 실패", e)
+            false
+        }
+    }
+
+    // "밀어서 결제" 슬라이더 노드를 찾아 그 영역을 쓸어준다
+    private fun slideToPay(allNodes: List<AccessibilityNodeInfo>): Boolean {
+        val slider = allNodes.firstOrNull {
+            val t = it.text?.toString() ?: ""
+            val d = it.contentDescription?.toString() ?: ""
+            t.contains("밀어서") || d.contains("밀어서") ||
+                    t.contains("밀어") || d.contains("밀어") ||
+                    t.contains("slide", ignoreCase = true) || d.contains("slide", ignoreCase = true)
+        } ?: return false
+
+        val rect = Rect()
+        slider.getBoundsInScreen(rect)
+        Log.d("Coupang", "밀어서결제 노드 bounds=$rect text='${slider.text}' desc='${slider.contentDescription}'")
+        if (rect.width() < 50) return false   // 영역이 비정상이면 포기
+        return swipeRight(rect)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
