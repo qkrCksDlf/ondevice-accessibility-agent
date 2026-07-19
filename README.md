@@ -5,8 +5,8 @@
 > 온디바이스 LLM(Llama 3.2 3B)과 클라우드 LangGraph 에이전트를 결합한 하이브리드 구조.
 
 ![Kotlin](https://img.shields.io/badge/Kotlin-Jetpack%20Compose-7F52FF)
-![llama.cpp](https://img.shields.io/badge/llama.cpp-C%2B%2B%2FJNI-blue)
-![LangGraph](https://img.shields.io/badge/LangGraph-ReAct-green)
+![llama.cpp](https://img.shields.io/badge/llama.cpp-C%2B%2B%20JNI-blue)
+![LangGraph](https://img.shields.io/badge/LangGraph-ReAct-green?style=flat)
 ![MCP](https://img.shields.io/badge/MCP-Tools-orange)
 
 <!-- TODO: 데모 GIF 또는 대표 스크린샷 1장 -->
@@ -89,6 +89,14 @@ flowchart TB
 
 <!-- TODO: 채팅 UI / 모드별 화면 / 코레일톡·쿠팡 자동화 오버레이 스크린샷 -->
 
+## 실행 방법
+
+<!-- TODO: 실제 빌드 환경에 맞게 수정 -->
+
+1. 이 저장소를 클론하고 Android Studio로 엽니다.
+2. GGUF 형식의 Llama 3.2 3B 모델 파일을 지정 경로에 배치합니다. <!-- TODO: 경로 명시 -->
+3. 빠른 모드 사용 시 [helpagent-server](<!-- TODO -->)를 실행하고 서버 주소를 설정합니다.
+4. 앱 실행 후 접근성 권한을 허용하면 앱 자동 조작 기능을 사용할 수 있습니다.
 
 
 
