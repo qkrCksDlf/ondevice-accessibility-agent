@@ -4,10 +4,6 @@
 > "부산 가는 기차표 예매해줘" 한마디면, 에이전트가 코레일톡을 직접 조작합니다.
 > 온디바이스 LLM(Llama 3.2 3B)과 클라우드 LangGraph 에이전트를 결합한 하이브리드 구조.
 
-![Kotlin](images/kotlin.svg)
-![llama.cpp](images/llamacpp.svg)
-![LangGraph](images/langgraph.svg)
-![MCP](images/mcp.svg)
 
 <!-- TODO: 데모 GIF 또는 대표 스크린샷 1장 -->
 
