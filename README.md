@@ -83,8 +83,8 @@ flowchart TB
 - MCP 도구 개발 — 날씨·대중교통 경로·웹 검색
 - 앱 자동화 — AccessibilityService 기반 코레일톡·쿠팡 조작, 오버레이 UI
 - 채팅 UI/UX 설계 및 앱 통합
+- LangGrahp 에이전트 설계, 구현
 
-서버 측 LangGraph 에이전트 설계·구현은 팀원이 담당했습니다.
 
 ## 스크린샷
 
