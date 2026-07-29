@@ -6,9 +6,10 @@
 
 <img src="images/badge-kotlin.png" alt="Kotlin · Jetpack Compose" height="20"> <img src="images/badge-llamacpp.png" alt="llama.cpp · C++ JNI" height="20"> <img src="images/badge-langgraph.png" alt="LangGraph · ReAct" height="20"> <img src="images/badge-mcp.png" alt="MCP · Tools" height="20">
 
-<!-- TODO: 데모 GIF 또는 대표 스크린샷 1장 -->
-
 ---
+
+<img src="images/he.png">
+
 
 ## 프로젝트 소개
 
