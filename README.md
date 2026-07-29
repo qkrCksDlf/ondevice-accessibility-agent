@@ -4,11 +4,11 @@
 > "부산 가는 기차표 예매해줘" 한마디면, 에이전트가 코레일톡을 직접 조작합니다.
 > 온디바이스 LLM(Llama 3.2 3B)과 클라우드 LangGraph 에이전트를 결합한 하이브리드 구조.
 
-<img src="images/badge-kotlin.png" alt="Kotlin · Jetpack Compose" height="20"> <img src="images/badge-llamacpp.png" alt="llama.cpp · C++ JNI" height="20"> <img src="images/badge-langgraph.png" alt="LangGraph · ReAct" height="20"> <img src="images/badge-mcp.png" alt="MCP · Tools" height="20">
+<img src="images/kotlin.svg" alt="Kotlin · Jetpack Compose" height="20"> <img src="images/badge-llamacpp.png" alt="llama.cpp · C++ JNI" height="20"> <img src="images/badge-langgraph.png" alt="LangGraph · ReAct" height="20"> <img src="images/badge-mcp.png" alt="MCP · Tools" height="20">
 
 ---
 
-<img src="images/he.png">
+<img src="images/he.jpg">
 
 
 ## 프로젝트 소개
