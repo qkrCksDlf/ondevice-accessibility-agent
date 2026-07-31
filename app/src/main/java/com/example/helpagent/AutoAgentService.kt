@@ -3,6 +3,9 @@ package com.example.helpagent
 import android.Manifest
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityService.GestureResultCallback
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -26,10 +29,12 @@ import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.animation.DecelerateInterpolator
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.ContextCompat
@@ -58,6 +63,14 @@ class AutoAgentService : AccessibilityService() {
     private var ktxRecognizer: SpeechRecognizer? = null
     private var ktxInputDeferred: CompletableDeferred<String>? = null
 
+    // 🌟 도움 채팅 오버레이 상태
+    private var helpOverlayView: View? = null
+    private var helpMessagesContainer: LinearLayout? = null
+    private var helpScrollView: ScrollView? = null
+    private var helpInputView: EditText? = null
+    private var helpLoadingBubble: TextView? = null
+    private var helpIsLoading: Boolean = false
+
     companion object {
         const val THEME_PURPLE = "#9C27B0"
         const val THEME_BACKGROUND = "#F0F2F5"
@@ -74,6 +87,9 @@ class AutoAgentService : AccessibilityService() {
         const val ID_ROUND_TRIP_CHECKBOX = "com.korail.talk:id/cb_round_trip"
         const val ID_SEARCH_BUTTON = "com.korail.talk:id/btn_right"
         const val ID_STATION_NAME_TXT = "com.korail.talk:id/stationNameTxt"
+
+        // 🌟 도움 채팅 영역 높이 (dp)
+        const val HELP_CHAT_HEIGHT_DP = 340f
     }
 
     enum class AgentState {
@@ -99,6 +115,312 @@ class AutoAgentService : AccessibilityService() {
                 }
             }
         }
+    }
+
+    // ============================================
+    // 🌟 도움 채팅 오버레이 (모든 "도움" 버튼 공통)
+    //   - 기존 오버레이/흐름 위에 새 창으로 뜸 (흐름 안 끊김)
+    //   - 항상 빠른 모드(서버) 호출, MCP 도구만 사용
+    //   - 쿠팡/코레일 자동화 명령은 절대 실행하지 않음
+    // ============================================
+    private fun showHelpChatOverlay() {
+        if (helpOverlayView != null) return   // 이미 떠있으면 무시
+        val ctx: Context = this
+
+        val wrapper = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor(THEME_BACKGROUND))
+            setPadding(dp(16f).toInt(), dp(12f).toInt(), dp(16f).toInt(), dp(14f).toInt())
+        }
+
+        // ── 상단: 타이틀 + 닫기 버튼 ──
+        val headerRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val titleView = TextView(ctx).apply {
+            text = "🤖  무엇이든 물어보세요!"
+            setTextColor(Color.parseColor(TEXT_DARK))
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        headerRow.addView(titleView, LinearLayout.LayoutParams(0,
+            LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        val closeBtn = TextView(ctx).apply {
+            text = "닫기 ✕"
+            setTextColor(Color.parseColor(CANCEL_RED))
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE); cornerRadius = dp(16f)
+                setStroke(dp(1.5f).toInt(), Color.parseColor(CANCEL_RED))
+            }
+            setPadding(dp(14f).toInt(), dp(7f).toInt(), dp(14f).toInt(), dp(7f).toInt())
+            setOnClickListener { closeHelpChatOverlay() }
+        }
+        headerRow.addView(closeBtn)
+        wrapper.addView(headerRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        // ── 채팅 메시지 영역 (높이 0 → 펼쳐지는 애니메이션) ──
+        val messagesContainer = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(6f).toInt(), 0, dp(6f).toInt())
+        }
+        helpMessagesContainer = messagesContainer
+
+        // 🌟 키보드가 올라와 공간이 좁아져도 입력줄을 가리지 않도록
+        //    스크롤 영역에 최대 높이를 둔 커스텀 ScrollView 사용
+        val maxScrollHeight = (resources.displayMetrics.heightPixels * 0.42f).toInt()
+        val scroll = object : ScrollView(ctx) {
+            override fun onMeasure(widthSpec: Int, heightSpec: Int) {
+                // 펼쳐진 뒤에는 내용만큼 늘되 maxScrollHeight 를 넘지 않게 제한
+                val limited = MeasureSpec.makeMeasureSpec(maxScrollHeight, MeasureSpec.AT_MOST)
+                super.onMeasure(widthSpec, limited)
+            }
+        }.apply {
+            isFillViewport = false
+            addView(messagesContainer, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
+        helpScrollView = scroll
+        // 🌟 시작 높이 0 → addView 후 애니메이션으로 펼침
+        wrapper.addView(scroll, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0
+        ).apply { setMargins(0, dp(8f).toInt(), 0, dp(8f).toInt()) })
+
+        // ── 입력줄: EditText + 전송 ──
+        val inputRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val edit = EditText(ctx).apply {
+            hint = "예) 라면은 뭐가 맛있어?"
+            setHintTextColor(Color.parseColor(TEXT_GRAY))
+            setTextColor(Color.parseColor(TEXT_DARK))
+            textSize = 14f
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE); cornerRadius = dp(20f)
+            }
+            setPadding(dp(14f).toInt(), dp(6f).toInt(), dp(14f).toInt(), dp(6f).toInt())
+            inputType = InputType.TYPE_CLASS_TEXT
+            imeOptions = EditorInfo.IME_ACTION_SEND
+            setOnEditorActionListener { _, actionId, _ ->
+                if (actionId == EditorInfo.IME_ACTION_SEND) { sendHelpMessage(); true } else false
+            }
+        }
+        helpInputView = edit
+        inputRow.addView(edit, LinearLayout.LayoutParams(0, dp(40f).toInt(), 1f).apply {
+            setMargins(0, 0, dp(8f).toInt(), 0)
+        })
+
+        val sendBtn = TextView(ctx).apply {
+            text = "↑"; setTextColor(Color.WHITE); textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(THEME_PURPLE)); cornerRadius = dp(22f)
+            }
+            setOnClickListener { sendHelpMessage() }
+        }
+        inputRow.addView(sendBtn, LinearLayout.LayoutParams(dp(40f).toInt(), dp(40f).toInt()))
+
+        wrapper.addView(inputRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        // ── 윈도우 추가 ──
+        //  · 포커스 가능(키보드 입력) + ADJUST_RESIZE 로 윈도우가 키보드만큼 줄어듦
+        //  · 줄어든 만큼 wrapper 에 bottom 패딩을 줘서 내용이 키보드 위로 올라감
+        val basePaddingBottom = dp(14f).toInt()
+        val windowParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.BOTTOM
+            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
+                    WindowManager.LayoutParams.SOFT_INPUT_STATE_UNCHANGED
+        }
+        helpOverlayView = wrapper
+        windowManager?.addView(helpOverlayView, windowParams)
+
+        // 키보드가 차지하는 높이(inset)만큼 wrapper 아래에 패딩을 줘서
+        // 채팅+입력창이 키보드 바로 위에 자연스럽게 붙도록 함
+        wrapper.setOnApplyWindowInsetsListener { v, insets ->
+            val imeBottom = try {
+                @Suppress("DEPRECATION")
+                insets.systemWindowInsetBottom
+            } catch (_: Exception) { 0 }
+            v.setPadding(
+                v.paddingLeft,
+                v.paddingTop,
+                v.paddingRight,
+                basePaddingBottom + imeBottom
+            )
+            insets
+        }
+        wrapper.requestApplyInsets()
+
+        // 첫 인사 버블
+        addHelpBubble(
+            "안녕하세요! 궁금한 걸 편하게 물어보세요.\n" +
+                    "예) 라면은 뭐가 맛있어? / 내일 날씨 어때?",
+            isUser = false
+        )
+
+        // 🌟 위로 자연스럽게 펼쳐지는 애니메이션 (gravity=BOTTOM 이라 위쪽으로 커짐)
+        //    애니메이션이 끝나면 높이를 WRAP_CONTENT 로 풀어서
+        //    (키보드로 공간이 좁아지면) maxScrollHeight 제한이 동작하도록 함
+        val expandTarget = minOf(dp(HELP_CHAT_HEIGHT_DP).toInt(), maxScrollHeight)
+        wrapper.post {
+            animateViewHeight(scroll, 0, expandTarget) {
+                val lp = scroll.layoutParams
+                lp.height = LinearLayout.LayoutParams.WRAP_CONTENT
+                scroll.layoutParams = lp
+            }
+        }
+    }
+
+    // 🌟 줄어드는 애니메이션 후 제거
+    private fun closeHelpChatOverlay() {
+        val scroll = helpScrollView
+        if (scroll == null) { removeHelpOverlay(); return }
+        // 키보드 먼저 내림
+        try {
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+            helpInputView?.windowToken?.let { imm.hideSoftInputFromWindow(it, 0) }
+        } catch (_: Exception) {}
+        animateViewHeight(scroll, scroll.height, 0) { removeHelpOverlay() }
+    }
+
+    private fun removeHelpOverlay() {
+        helpOverlayView?.let {
+            try { windowManager?.removeView(it) } catch (_: Exception) {}
+            helpOverlayView = null
+        }
+        helpMessagesContainer = null
+        helpScrollView = null
+        helpInputView = null
+        helpLoadingBubble = null
+        helpIsLoading = false
+    }
+
+    // 🌟 높이 애니메이션 헬퍼
+    private fun animateViewHeight(view: View, from: Int, to: Int, onEnd: (() -> Unit)? = null) {
+        val animator = ValueAnimator.ofInt(from, to)
+        animator.duration = 320
+        animator.interpolator = DecelerateInterpolator()
+        animator.addUpdateListener {
+            val lp = view.layoutParams
+            lp.height = it.animatedValue as Int
+            view.layoutParams = lp
+        }
+        if (onEnd != null) {
+            animator.addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) { onEnd() }
+            })
+        }
+        animator.start()
+    }
+
+    // 🌟 채팅 버블 추가 (isUser=true 오른쪽 보라, false 왼쪽 흰색)
+    private fun addHelpBubble(text: String, isUser: Boolean): TextView {
+        val ctx: Context = this
+        val bubble = TextView(ctx).apply {
+            this.text = text
+            textSize = 15f
+            setTextColor(if (isUser) Color.WHITE else Color.parseColor(TEXT_DARK))
+            background = GradientDrawable().apply {
+                setColor(if (isUser) Color.parseColor(THEME_PURPLE) else Color.parseColor(BUBBLE_BOT_BG))
+                cornerRadius = dp(16f)
+            }
+            setPadding(dp(13f).toInt(), dp(10f).toInt(), dp(13f).toInt(), dp(10f).toInt())
+            maxWidth = (resources.displayMetrics.widthPixels * 0.72f).toInt()
+        }
+        val lp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = if (isUser) Gravity.END else Gravity.START
+            setMargins(0, dp(4f).toInt(), 0, dp(4f).toInt())
+        }
+        helpMessagesContainer?.addView(bubble, lp)
+        helpScrollView?.post { helpScrollView?.fullScroll(View.FOCUS_DOWN) }
+        return bubble
+    }
+
+    // 🌟 도움 채팅 전송: 항상 서버(빠른 모드) 호출
+    //    intent 가 buy_product/book_ktx/select_item 이어도 자동화는 실행 안 함!
+    private fun sendHelpMessage() {
+        val text = helpInputView?.text?.toString()?.trim() ?: ""
+        if (text.isEmpty() || helpIsLoading) return
+
+        // 🌟 보내기 누르면 키보드 자동으로 내려감
+        try {
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+            helpInputView?.windowToken?.let { imm.hideSoftInputFromWindow(it, 0) }
+            helpInputView?.clearFocus()
+        } catch (_: Exception) {}
+
+        helpInputView?.setText("")
+        addHelpBubble(text, isUser = true)
+
+        helpIsLoading = true
+        helpLoadingBubble = addHelpBubble("생각 중...", isUser = false)
+
+        serviceScope.launch {
+            val result = withContext(Dispatchers.IO) { callSpeedServer(text) }
+
+            // 로딩 버블 제거
+            helpLoadingBubble?.let { helpMessagesContainer?.removeView(it) }
+            helpLoadingBubble = null
+            helpIsLoading = false
+
+            if (helpOverlayView == null) return@launch   // 응답 오기 전에 닫았으면 무시
+
+            if (result == null) {
+                addHelpBubble("서버에 연결할 수 없어요.\n와이파이 연결을 확인해 주세요.", isUser = false)
+                return@launch
+            }
+
+            val cmd = result.command
+            val reply = when {
+                // 🌟 쿠팡/코레일 자동화 intent → 명령 실행하지 않고 안내만
+                cmd.intent in listOf("buy_product", "select_item", "book_ktx") -> {
+                    val base = cmd.confirmationText.ifBlank { "알겠어요!" }
+                    "$base\n\n👉 구매나 예매는 이 창을 닫고\n채팅 화면에서 말씀해 주시면 바로 도와드릴게요!"
+                }
+                // 길찾기 결과는 텍스트로 요약
+                result.route != null -> formatRouteAsText(result.route!!, cmd.confirmationText)
+                else -> cmd.confirmationText.ifBlank { "죄송해요, 답을 찾지 못했어요. 다시 물어봐 주세요." }
+            }
+            addHelpBubble(reply, isUser = false)
+        }
+    }
+
+    // 🌟 TransitRoute → 도움 채팅용 텍스트 요약
+    private fun formatRouteAsText(route: TransitRoute, msg: String): String {
+        val sb = StringBuilder()
+        if (msg.isNotBlank()) sb.append(msg).append("\n\n")
+        sb.append("${route.from} → ${route.to}")
+        val summary = mutableListOf<String>()
+        route.totalTimeMin?.let { summary.add("약 ${it}분") }
+        summary.add("환승 ${route.transferCount}회")
+        route.fare?.let { summary.add("${it}원") }
+        sb.append("\n(").append(summary.joinToString(" · ")).append(")")
+        route.steps.forEach { step ->
+            when (step.mode) {
+                "walk" -> sb.append("\n🚶 걷기").append(step.timeMin?.let { " 약 ${it}분" } ?: "")
+                "subway" -> sb.append("\n🚇 ${step.line}: ${step.from} → ${step.to}")
+                "bus" -> sb.append("\n🚌 ${step.line}: ${step.from} → ${step.to}")
+                else -> sb.append("\n• ${step.from} → ${step.to}")
+            }
+        }
+        return sb.toString()
     }
 
     // ============================================
@@ -518,14 +840,9 @@ class AutoAgentService : AccessibilityService() {
                     Log.d("KtxFlow", "사용자가 취소함")
                     removeKtxOverlay()
                     return@launch
-                } else if (reserveResult == "help") {
-                    Toast.makeText(applicationContext,
-                        "도움 기능은 준비 중입니다.",
-                        Toast.LENGTH_SHORT).show()
-                    removeKtxOverlay()
-                    return@launch
                 }
                 removeKtxOverlay()
+                removeHelpOverlay()   // 🌟 도움 채팅이 열려있었으면 다음 단계 전에 정리
                 delay(1000)
                 debugDumpScreen("예매 후 화면")
 
@@ -838,7 +1155,8 @@ class AutoAgentService : AccessibilityService() {
                     setStroke(dp(1.5f).toInt(), Color.parseColor(THEME_PURPLE))
                 }
                 stateListAnimator = null
-                setOnClickListener { ktxInputDeferred?.complete("help") }
+                // 🌟 도움 채팅 오버레이를 위에 띄움 (기존 흐름은 그대로 유지)
+                setOnClickListener { showHelpChatOverlay() }
             }
             btnRow.addView(helpBtn, LinearLayout.LayoutParams(0, dp(44f).toInt(), 1f).apply {
                 setMargins(dp(4f).toInt(), 0, dp(4f).toInt(), 0)
@@ -1409,7 +1727,7 @@ class AutoAgentService : AccessibilityService() {
     }
 
     // ============================================
-    // 이하 쿠팡 자동화 (변경 없음)
+    // 이하 쿠팡 자동화
     // ============================================
 
     private fun runCoupangAutomation(query: String, autoMode: Boolean = false) {
@@ -1451,9 +1769,6 @@ class AutoAgentService : AccessibilityService() {
                         val action = showPickOverlayAndDetect()
                         when (action) {
                             "cancel" -> currentState = AgentState.CANCELLED
-                            "help" -> withContext(Dispatchers.Main) {
-                                Toast.makeText(applicationContext, "도움 기능은 준비 중입니다.", Toast.LENGTH_SHORT).show()
-                            }
                             "auto" -> {
                                 withContext(Dispatchers.Main) {
                                     Toast.makeText(applicationContext, "괜찮은 상품을 골라드릴게요...", Toast.LENGTH_SHORT).show()
@@ -1468,9 +1783,6 @@ class AutoAgentService : AccessibilityService() {
                         val action = showBuyOverlay()
                         when (action) {
                             "cancel" -> currentState = AgentState.CANCELLED
-                            "help" -> withContext(Dispatchers.Main) {
-                                Toast.makeText(applicationContext, "도움 기능은 준비 중입니다.", Toast.LENGTH_SHORT).show()
-                            }
                             "buy" -> { currentState = AgentState.CLICK_BUY_NOW; stateWaitCount = 0 }
                             else -> currentState = AgentState.CANCELLED
                         }
@@ -1573,6 +1885,7 @@ class AutoAgentService : AccessibilityService() {
                     AgentState.CANCELLED -> {
                         withContext(Dispatchers.Main) {
                             removeOverlay()
+                            removeHelpOverlay()
                             Toast.makeText(applicationContext, "취소되었습니다.", Toast.LENGTH_LONG).show()
                         }
                         val backIntent = packageManager.getLaunchIntentForPackage(packageName)
@@ -1901,7 +2214,8 @@ class AutoAgentService : AccessibilityService() {
             }
             stateListAnimator = null
         }
-        helpBtn.setOnClickListener { userActionDeferred?.complete("help") }
+        // 🌟 도움 채팅 오버레이를 위에 띄움 (deferred 는 건드리지 않아서 흐름 유지)
+        helpBtn.setOnClickListener { showHelpChatOverlay() }
         val btnParams = LinearLayout.LayoutParams(0, dp(44f).toInt(), 1f).apply {
             setMargins(dp(4f).toInt(), 0, dp(4f).toInt(), 0)
         }
@@ -2002,7 +2316,7 @@ class AutoAgentService : AccessibilityService() {
 
     override fun onInterrupt() {
         serviceScope.launch(Dispatchers.Main) {
-            removeOverlay(); removeKtxOverlay()
+            removeOverlay(); removeKtxOverlay(); removeHelpOverlay()
         }
     }
 }

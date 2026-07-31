@@ -19,6 +19,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -29,19 +30,28 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.keyframes
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.DirectionsBus
 import androidx.compose.material.icons.filled.DirectionsWalk
+import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Mic
@@ -55,12 +65,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -99,7 +113,7 @@ val ArriveOrange = Color(0xFFD85A30)
 val CardLineColor = Color(0xFFE0E0E0)
 val ChipBg = Color(0xFFF0F0F0)
 
-const val SPEED_SERVER_URL = "http://192.168.0.5:8000/chat"
+const val SPEED_SERVER_URL = "http://10.136.95.1:8000/chat"
 
 // 🌟 길찾기 한 구간 (지하철/버스/도보)
 data class TransitStep(
@@ -142,6 +156,25 @@ private val httpClient = OkHttpClient.Builder()
 data class SpeedResult(
     val command: AgentCommand,
     val route: TransitRoute? = null
+)
+
+// ===============================================
+// 🌟 드로어(사이드 메뉴) 화면 구분
+// ===============================================
+enum class DrawerScreen { MENU, COUPANG_GUIDE, KORAIL_GUIDE }
+
+// 🌟 데모용 채팅 기록 항목
+data class DemoChatHistory(
+    val title: String,
+    val date: String
+)
+
+val DEMO_CHAT_HISTORY = listOf(
+    DemoChatHistory("라면 주문하기", "오늘"),
+    DemoChatHistory("서울 → 대전 기차표 예매", "어제"),
+    DemoChatHistory("인천시청에서 부평역 가는 길", "어제"),
+    DemoChatHistory("내일 날씨 물어보기", "6월 8일"),
+    DemoChatHistory("휴지 주문하기", "6월 5일")
 )
 
 class MainActivity : ComponentActivity() {
@@ -189,37 +222,37 @@ class MainActivity : ComponentActivity() {
 // LLM 프롬프트 (온디바이스용)
 // ===============================================
 fun buildAdvancedPrompt(
-    userInput: String,
-    currentItems: List<String>
+    userInput: String
 ): String {
-    val itemsContext = if (currentItems.isNotEmpty()) {
-        currentItems.mapIndexed { i, s -> "${i + 1}. $s" }.joinToString("\n")
-    } else "없음"
-
     return """<|start_header_id|>system<|end_header_id|>
 JSON만 출력하는 분류기.
 
-intent: chat / buy_product / book_ktx / select_item
-
-쿠팡목록: $itemsContext
+intent: chat / buy_product / book_ktx
+- buy_product: 물건 사기/주문/필요/떨어짐
+- book_ktx: 기차/KTX 예매
+- chat: 그 외 모든 대화. 물건·기차를 언급만 하면 chat.
 
 형식: {"intent":"...","query":"...","msg":"한국어"}
+query는 buy_product 일 때만 물건명, 나머지는 "".
 
 예시:
 입력: 안녕
-{"intent":"chat","query":"","msg":"안녕하세요!"}
+{"intent":"chat","query":"","msg":"안녕하세요! 무엇을 도와드릴까요?"}
+
+입력: 라면 맛있겠다
+{"intent":"chat","query":"","msg":"라면 맛있죠! 드시고 싶으면 주문도 도와드려요."}
 
 입력: 라면 사줘
 {"intent":"buy_product","query":"라면","msg":"네, 라면을 찾아드릴게요."}
+
+입력: 세제 떨어졌어
+{"intent":"buy_product","query":"세제","msg":"네, 세제를 찾아드릴게요."}
 
 입력: 기차 예매해줘
 {"intent":"book_ktx","query":"","msg":"네, 기차표 예매 도와드릴게요."}
 
 입력: KTX 타고 싶어
-{"intent":"book_ktx","query":"","msg":"네, 기차표 예매 도와드릴게요."}
-
-입력: 휴지 사줘
-{"intent":"buy_product","query":"휴지","msg":"네, 휴지를 찾아드릴게요."}<|eot_id|><|start_header_id|>user<|end_header_id|>
+{"intent":"book_ktx","query":"","msg":"네, 기차표 예매 도와드릴게요."}<|eot_id|><|start_header_id|>user<|end_header_id|>
 $userInput<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 """.trimIndent()
 }
@@ -352,9 +385,12 @@ suspend fun fetchCurrentLocation(context: Context): Location? {
     return deferred.await()
 }
 
-fun callSpeedServer(userMessage: String): SpeedResult? {
+fun callSpeedServer(userMessage: String, mode: String = "chat"): SpeedResult? {
     return try {
-        val json = JSONObject().put("message", userMessage).toString()
+        val json = JSONObject()
+            .put("message", userMessage)
+            .put("mode", mode)      // 🌟 "help" 면 서버가 쿠팡/코레일 intent 없이 순수 채팅+MCP만
+            .toString()
         val body = json.toRequestBody("application/json".toMediaType())
         val request = Request.Builder()
             .url(SPEED_SERVER_URL)
@@ -481,6 +517,331 @@ fun MenuButton(
             tint = accentColor,
             modifier = Modifier.size(24.dp)
         )
+    }
+}
+
+// ===============================================
+// 🌟 사이드 메뉴 (드로어)
+// ===============================================
+
+@Composable
+fun DrawerContent(
+    accentColor: Color,
+    currentScreen: DrawerScreen,
+    onScreenChange: (DrawerScreen) -> Unit
+) {
+    // 메뉴 ↔ 가이드 상세 좌우 슬라이드 전환
+    AnimatedContent(
+        targetState = currentScreen,
+        transitionSpec = {
+            if (targetState == DrawerScreen.MENU) {
+                // 상세 → 메뉴 (뒤로): 왼쪽에서 들어옴
+                slideInHorizontally { -it } togetherWith slideOutHorizontally { it }
+            } else {
+                // 메뉴 → 상세 (앞으로): 오른쪽에서 들어옴
+                slideInHorizontally { it } togetherWith slideOutHorizontally { -it }
+            }
+        },
+        label = "drawerScreen"
+    ) { screen ->
+        when (screen) {
+            DrawerScreen.MENU -> DrawerMenuScreen(
+                accentColor = accentColor,
+                onGuideClick = { onScreenChange(it) }
+            )
+            DrawerScreen.COUPANG_GUIDE -> GuideDetailScreen(
+                accentColor = accentColor,
+                emoji = "🛒",
+                title = "쿠팡 초기설정",
+                intro = "쿠팡에 로그인이 되어 있어야\nHelpAgent가 장보기를 도와드릴 수 있어요.",
+                steps = listOf(
+                    "Play 스토어에서 '쿠팡'을 검색해 설치해요.",
+                    "쿠팡 앱을 열고 오른쪽 아래 '마이쿠팡'을 눌러요.",
+                    "'로그인'을 누르고, 계정이 없으면 '회원가입'을 눌러요.",
+                    "이름, 이메일, 비밀번호, 휴대폰 번호를 입력하고 인증번호를 받으면 가입 완료!",
+                    "처음 한 번은 집 주소(배송지)와 결제할 카드를 등록해 주세요.",
+                    "여기까지 해 두면 다음부터는 \"라면 사줘\" 한마디로 주문할 수 있어요!"
+                ),
+                onBack = { onScreenChange(DrawerScreen.MENU) }
+            )
+            DrawerScreen.KORAIL_GUIDE -> GuideDetailScreen(
+                accentColor = accentColor,
+                emoji = "🚄",
+                title = "코레일톡 초기설정",
+                intro = "코레일톡에 로그인이 되어 있어야\nHelpAgent가 기차표 예매를 도와드릴 수 있어요.",
+                steps = listOf(
+                    "Play 스토어에서 '코레일톡'을 검색해 설치해요.",
+                    "앱을 열고 오른쪽 위 메뉴(☰)에서 '로그인'을 눌러요.",
+                    "회원이 아니면 '회원가입'을 누르고 이름과 휴대폰 번호로 인증해요.",
+                    "비밀번호를 정한 뒤 로그인까지 해 두세요.",
+                    "기차표 결제에 쓸 카드를 미리 준비해 두면 예매가 더 빨라요.",
+                    "여기까지 해 두면 \"기차표 예매해줘\" 한마디로 시작할 수 있어요!"
+                ),
+                onBack = { onScreenChange(DrawerScreen.MENU) }
+            )
+        }
+    }
+}
+
+// 🌟 드로어 첫 화면: 타이틀 + 큰 가이드 버튼 2개 + 데모 채팅 기록
+@Composable
+fun DrawerMenuScreen(
+    accentColor: Color,
+    onGuideClick: (DrawerScreen) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 24.dp)
+    ) {
+        // 앱 이름
+        Text(
+            text = "HelpAgent",
+            fontSize = 28.sp,
+            fontWeight = FontWeight.Bold,
+            color = accentColor
+        )
+        Text(
+            text = "당신 곁의 AI 도우미",
+            fontSize = 14.sp,
+            color = TextGray,
+            modifier = Modifier.padding(top = 4.dp)
+        )
+
+        Spacer(Modifier.height(24.dp))
+
+        Text(
+            text = "초기 설정 하는 법",
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold,
+            color = TextDark
+        )
+
+        Spacer(Modifier.height(12.dp))
+
+        // 🌟 큰 버튼 1: 쿠팡
+        BigGuideButton(
+            emoji = "🛒",
+            title = "쿠팡 초기설정",
+            subtitle = "장보기 준비하기",
+            accentColor = accentColor,
+            onClick = { onGuideClick(DrawerScreen.COUPANG_GUIDE) }
+        )
+
+        Spacer(Modifier.height(12.dp))
+
+        // 🌟 큰 버튼 2: 코레일톡
+        BigGuideButton(
+            emoji = "🚄",
+            title = "코레일톡 초기설정",
+            subtitle = "기차표 예매 준비하기",
+            accentColor = accentColor,
+            onClick = { onGuideClick(DrawerScreen.KORAIL_GUIDE) }
+        )
+
+        HorizontalDivider(
+            modifier = Modifier.padding(vertical = 22.dp),
+            color = CardLineColor
+        )
+
+        // 🌟 데모용 채팅 기록
+        Text(
+            text = "채팅 기록",
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold,
+            color = TextDark
+        )
+
+        Spacer(Modifier.height(10.dp))
+
+        DEMO_CHAT_HISTORY.forEach { history ->
+            DemoChatHistoryItem(history = history)
+            Spacer(Modifier.height(8.dp))
+        }
+
+        Spacer(Modifier.height(16.dp))
+    }
+}
+
+// 🌟 모서리 둥근 큰 가이드 버튼
+@Composable
+fun BigGuideButton(
+    emoji: String,
+    title: String,
+    subtitle: String,
+    accentColor: Color,
+    onClick: () -> Unit
+) {
+    // 반투명 색을 흰색 위에 미리 합성해서 불투명한 색으로 만듦
+    // (반투명 배경 + shadow 조합이면 그림자가 배경 뒤로 비쳐서 회색 띠처럼 보임)
+    val buttonBg = accentColor.copy(alpha = 0.08f).compositeOver(Color.White)
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(80.dp)
+            .shadow(2.dp, RoundedCornerShape(20.dp))
+            .background(buttonBg, RoundedCornerShape(20.dp))
+            .clickable { onClick() }
+            .padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // 이모지 동그라미
+        Box(
+            modifier = Modifier
+                .size(46.dp)
+                .background(Color.White, CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(text = emoji, fontSize = 23.sp)
+        }
+
+        Spacer(Modifier.width(12.dp))
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                color = TextDark,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = subtitle,
+                fontSize = 12.sp,
+                color = TextGray,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 2.dp)
+            )
+        }
+
+        Icon(
+            imageVector = Icons.Filled.KeyboardArrowRight,
+            contentDescription = null,
+            tint = accentColor,
+            modifier = Modifier.size(26.dp)
+        )
+    }
+}
+
+// 🌟 데모용 채팅 기록 한 줄
+@Composable
+fun DemoChatHistoryItem(history: DemoChatHistory) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFFF7F7F7), RoundedCornerShape(14.dp))
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = history.title,
+            fontSize = 15.sp,
+            color = TextDark,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+        Text(
+            text = history.date,
+            fontSize = 12.sp,
+            color = TextGray,
+            modifier = Modifier.padding(start = 8.dp)
+        )
+    }
+}
+
+// 🌟 가이드 상세 화면 (뒤로가기 + 번호 매긴 단계들)
+@Composable
+fun GuideDetailScreen(
+    accentColor: Color,
+    emoji: String,
+    title: String,
+    intro: String,
+    steps: List<String>,
+    onBack: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 20.dp)
+    ) {
+        // 상단: 뒤로가기 + 제목
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .background(accentColor.copy(alpha = 0.1f), CircleShape)
+                    .clickable { onBack() },
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.ArrowBack,
+                    contentDescription = "뒤로",
+                    tint = accentColor,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Text(text = emoji, fontSize = 22.sp)
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = title,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold,
+                color = TextDark
+            )
+        }
+
+        Spacer(Modifier.height(14.dp))
+
+        Text(
+            text = intro,
+            fontSize = 14.sp,
+            color = TextGray,
+            lineHeight = 21.sp
+        )
+
+        Spacer(Modifier.height(18.dp))
+
+        // 단계별 안내
+        steps.forEachIndexed { index, step ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFFF7F7F7), RoundedCornerShape(14.dp))
+                    .padding(14.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .background(accentColor, CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "${index + 1}",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Text(
+                    text = step,
+                    fontSize = 15.sp,
+                    color = TextDark,
+                    lineHeight = 22.sp,
+                    modifier = Modifier.padding(top = 1.dp)
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+
+        Spacer(Modifier.height(20.dp))
     }
 }
 
@@ -785,6 +1146,8 @@ private fun formatFare(fare: Int): String =
 @Composable
 fun ChatScreen(generateResponse: (String) -> String) {
     val context = LocalContext.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
     var hasPermission by remember {
         mutableStateOf(isAccessibilityServiceEnabled(context, AutoAgentService::class.java))
     }
@@ -797,6 +1160,15 @@ fun ChatScreen(generateResponse: (String) -> String) {
     var isListening by remember { mutableStateOf(false) }
 
     var currentMode by remember { mutableStateOf(AgentMode.PRIVACY) }
+
+    // 🌟 사이드 메뉴(드로어) 상태
+    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+    var drawerScreen by remember { mutableStateOf(DrawerScreen.MENU) }
+
+    // 🌟 드로어 닫히면 다음에 열 때 항상 메뉴 화면부터
+    LaunchedEffect(drawerState.isClosed) {
+        if (drawerState.isClosed) drawerScreen = DrawerScreen.MENU
+    }
 
     val accentColor by animateColorAsState(
         targetValue = if (currentMode == AgentMode.SPEED) SpeedOrange else ThemePurple,
@@ -941,7 +1313,7 @@ fun ChatScreen(generateResponse: (String) -> String) {
             val cmd: AgentCommand? = if (currentMode == AgentMode.SPEED) {
                 speedResult?.command
             } else {
-                val prompt = buildAdvancedPrompt(sendText, currentProductOptions)
+                val prompt = buildAdvancedPrompt(sendText)
                 val reply = withContext(Dispatchers.IO) { generateResponse(prompt) }
                 parseLlmResponse(reply)
             }
@@ -1008,6 +1380,20 @@ fun ChatScreen(generateResponse: (String) -> String) {
     // 🌟 런처 콜백이 호출할 수 있도록 ref 연결
     submitMessageRef.value = { t -> submitMessage(t) }
 
+    // 🌟 입력창 내용 전송 (전송 버튼 / 키보드 엔터 양쪽에서 호출)
+    fun sendCurrentInput(hideKeyboard: Boolean) {
+        if (inputText.isBlank() || isLoading) return
+        if (hideKeyboard) {
+            keyboardController?.hide()
+            focusManager.clearFocus()
+        }
+        val text = inputText
+        inputText = ""
+        isLoading = true
+        messages = messages + Message(text, true)
+        submitMessage(text)
+    }
+
     LaunchedEffect(context) {
         hasPermission = isAccessibilityServiceEnabled(context, AutoAgentService::class.java)
     }
@@ -1045,199 +1431,216 @@ fun ChatScreen(generateResponse: (String) -> String) {
         )
     }
 
-    Column(
-        Modifier
-            .fillMaxSize()
-            .background(bgColor)
-            .systemBarsPadding()
-            .imePadding()
-    ) {
-        // 🌟 상단: [메뉴] + [토글]
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            MenuButton(
-                accentColor = accentColor,
-                onClick = {
-                    Toast.makeText(context, "메뉴 (준비 중)", Toast.LENGTH_SHORT).show()
-                }
-            )
-
-            Box(
-                modifier = Modifier.weight(1f),
-                contentAlignment = Alignment.CenterEnd
+    // 🌟 사이드 메뉴(드로어)로 전체 화면 감싸기
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        gesturesEnabled = drawerState.isOpen,   // 열려있을 때만 스와이프로 닫기 (채팅 스크롤과 충돌 방지)
+        drawerContent = {
+            ModalDrawerSheet(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .fillMaxWidth(0.8f),        // 🌟 세로 꽉 채우고 가로 80%
+                drawerContainerColor = Color.White,
+                drawerShape = RoundedCornerShape(topEnd = 24.dp, bottomEnd = 24.dp)
             ) {
-                BigModeToggle(
-                    currentMode = currentMode,
+                DrawerContent(
                     accentColor = accentColor,
-                    onToggle = {
-                        currentMode = if (currentMode == AgentMode.PRIVACY)
-                            AgentMode.SPEED else AgentMode.PRIVACY
-                        val msg = when (currentMode) {
-                            AgentMode.PRIVACY -> "🔒 안전 모드로 바꿨어요. 인터넷 없이 동작해요."
-                            AgentMode.SPEED -> "⚡ 빠른 모드로 바꿨어요. 날씨 같은 정보도 알 수 있어요."
-                        }
-                        messages = messages + Message(msg, false)
-                    }
+                    currentScreen = drawerScreen,
+                    onScreenChange = { drawerScreen = it }
                 )
             }
         }
-
-        // 채팅 메시지 영역
-        LazyColumn(
-            state = listState,
-            modifier = Modifier
-                .weight(1f)
-                .padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .background(bgColor)
+                .systemBarsPadding()
+                .imePadding()
         ) {
-            items(messages) { msg ->
-                if (msg.route != null) {
-                    // 🌟 길찾기 카드 (말풍선 대신)
-                    TransitRouteCard(route = msg.route)
-                } else {
-                    Box(
-                        Modifier.fillMaxWidth(),
-                        if (msg.isUser) Alignment.CenterEnd else Alignment.CenterStart
-                    ) {
-                        Text(
-                            text = msg.text,
-                            color = if (msg.isUser) Color.White else TextDark,
-                            fontSize = 16.sp,
-                            modifier = Modifier
-                                .background(
-                                    if (msg.isUser) accentColor else BubbleBotBg,
-                                    RoundedCornerShape(20.dp)
-                                )
-                                .padding(horizontal = 16.dp, vertical = 12.dp)
-                        )
+            // 🌟 상단: [메뉴] + [토글]
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                MenuButton(
+                    accentColor = accentColor,
+                    onClick = {
+                        coroutineScope.launch { drawerState.open() }
                     }
+                )
+
+                Box(
+                    modifier = Modifier.weight(1f),
+                    contentAlignment = Alignment.CenterEnd
+                ) {
+                    BigModeToggle(
+                        currentMode = currentMode,
+                        accentColor = accentColor,
+                        onToggle = {
+                            currentMode = if (currentMode == AgentMode.PRIVACY)
+                                AgentMode.SPEED else AgentMode.PRIVACY
+                            val msg = when (currentMode) {
+                                AgentMode.PRIVACY -> "🔒 안전 모드로 바꿨어요. 인터넷 없이 동작해요."
+                                AgentMode.SPEED -> "⚡ 빠른 모드로 바꿨어요. 날씨 같은 정보도 알 수 있어요."
+                            }
+                            messages = messages + Message(msg, false)
+                        }
+                    )
                 }
             }
 
-            // 🌟 로딩 인디케이터: 점 세 개 춤추기
-            if (isLoading) {
-                item {
-                    Box(
-                        Modifier.fillMaxWidth(),
-                        Alignment.CenterStart
-                    ) {
-                        TypingIndicator(dotColor = accentColor)
-                    }
-                }
-            }
-
-            if (currentProductOptions.isNotEmpty()) {
-                item {
-                    Column(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
-                        currentProductOptions.forEach { product ->
-                            Button(
-                                onClick = {
-                                    messages = messages + Message("👉 $product 선택함", true)
-                                    messages = messages + Message("알겠습니다! 결제 준비를 시작합니다.", false)
-                                    val buyCommand = AgentCommand(
-                                        intent = "select_item",
-                                        stage = "buy",
-                                        systemAction = "click",
-                                        query = product,
-                                        confirmationText = ""
-                                    )
-                                    AgentController.sendCommand(buyCommand)
-                                    currentProductOptions = emptyList()
-                                },
+            // 채팅 메시지 영역
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(horizontal = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                items(messages) { msg ->
+                    if (msg.route != null) {
+                        // 🌟 길찾기 카드 (말풍선 대신)
+                        TransitRouteCard(route = msg.route)
+                    } else {
+                        Box(
+                            Modifier.fillMaxWidth(),
+                            if (msg.isUser) Alignment.CenterEnd else Alignment.CenterStart
+                        ) {
+                            Text(
+                                text = msg.text,
+                                color = if (msg.isUser) Color.White else TextDark,
+                                fontSize = 16.sp,
                                 modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 4.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color.White)
-                            ) {
-                                Text(
-                                    text = product,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                    color = accentColor,
-                                    fontWeight = FontWeight.Bold
-                                )
+                                    .background(
+                                        if (msg.isUser) accentColor else BubbleBotBg,
+                                        RoundedCornerShape(20.dp)
+                                    )
+                                    .padding(horizontal = 16.dp, vertical = 12.dp)
+                            )
+                        }
+                    }
+                }
+
+                // 🌟 로딩 인디케이터: 점 세 개 춤추기
+                if (isLoading) {
+                    item {
+                        Box(
+                            Modifier.fillMaxWidth(),
+                            Alignment.CenterStart
+                        ) {
+                            TypingIndicator(dotColor = accentColor)
+                        }
+                    }
+                }
+
+                if (currentProductOptions.isNotEmpty()) {
+                    item {
+                        Column(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                            currentProductOptions.forEach { product ->
+                                Button(
+                                    onClick = {
+                                        messages = messages + Message("👉 $product 선택함", true)
+                                        messages = messages + Message("알겠습니다! 결제 준비를 시작합니다.", false)
+                                        val buyCommand = AgentCommand(
+                                            intent = "select_item",
+                                            stage = "buy",
+                                            systemAction = "click",
+                                            query = product,
+                                            confirmationText = ""
+                                        )
+                                        AgentController.sendCommand(buyCommand)
+                                        currentProductOptions = emptyList()
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 4.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color.White)
+                                ) {
+                                    Text(
+                                        text = product,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                        color = accentColor,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
                         }
                     }
                 }
+
+                item { Spacer(Modifier.height(4.dp)) }
             }
 
-            item { Spacer(Modifier.height(4.dp)) }
-        }
-
-        // 🌟 입력창 영역
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 12.dp)
-        ) {
-            Row(
+            // 🌟 입력창 영역
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 64.dp)
-                    .shadow(2.dp, RoundedCornerShape(20.dp))
-                    .background(Color.White, RoundedCornerShape(20.dp))
-                    .padding(horizontal = 8.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .padding(horizontal = 16.dp, vertical = 12.dp)
             ) {
-                Box(
+                Row(
                     modifier = Modifier
-                        .size(48.dp)
-                        .background(
-                            if (isListening) Color.Red else accentColor,
-                            CircleShape
+                        .fillMaxWidth()
+                        .heightIn(min = 64.dp)
+                        .shadow(2.dp, RoundedCornerShape(20.dp))
+                        .background(Color.White, RoundedCornerShape(20.dp))
+                        .padding(horizontal = 8.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(48.dp)
+                            .background(
+                                if (isListening) Color.Red else accentColor,
+                                CircleShape
+                            )
+                            .clickable {
+                                micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                startListening()
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = if (isListening) Icons.Filled.Stop else Icons.Filled.Mic,
+                            contentDescription = if (isListening) "정지" else "음성 입력",
+                            tint = Color.White,
+                            modifier = Modifier.size(24.dp)
                         )
-                        .clickable {
-                            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                            startListening()
-                        },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = if (isListening) Icons.Filled.Stop else Icons.Filled.Mic,
-                        contentDescription = if (isListening) "정지" else "음성 입력",
-                        tint = Color.White,
-                        modifier = Modifier.size(24.dp)
+                    }
+
+                    Spacer(Modifier.width(10.dp))
+
+                    BasicTextFieldWrapper(
+                        value = inputText,
+                        onValueChange = { inputText = it },
+                        enabled = !isLoading,
+                        placeholder = "말씀하거나 입력해 주세요",
+                        onSend = { sendCurrentInput(hideKeyboard = true) },   // 🌟 엔터 → 전송 + 키보드 내림
+                        modifier = Modifier.weight(1f)
                     )
-                }
 
-                Spacer(Modifier.width(10.dp))
+                    Spacer(Modifier.width(10.dp))
 
-                BasicTextFieldWrapper(
-                    value = inputText,
-                    onValueChange = { inputText = it },
-                    enabled = !isLoading,
-                    placeholder = "말씀하거나 입력해 주세요",
-                    modifier = Modifier.weight(1f)
-                )
-
-                Spacer(Modifier.width(10.dp))
-
-                Box(
-                    modifier = Modifier
-                        .size(48.dp)
-                        .background(accentColor, CircleShape)
-                        .clickable {
-                            if (inputText.isBlank() || isLoading) return@clickable
-                            val text = inputText
-                            inputText = ""
-                            isLoading = true
-                            messages = messages + Message(text, true)
-                            submitMessage(text)
-                        },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.ArrowUpward,
-                        contentDescription = "전송",
-                        tint = Color.White,
-                        modifier = Modifier.size(24.dp)
-                    )
+                    Box(
+                        modifier = Modifier
+                            .size(48.dp)
+                            .background(accentColor, CircleShape)
+                            .clickable {
+                                sendCurrentInput(hideKeyboard = true)         // 🌟 버튼 → 전송 + 키보드 내림
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.ArrowUpward,
+                            contentDescription = "전송",
+                            tint = Color.White,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
                 }
             }
         }
@@ -1250,12 +1653,16 @@ fun BasicTextFieldWrapper(
     onValueChange: (String) -> Unit,
     enabled: Boolean,
     placeholder: String,
+    onSend: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     androidx.compose.foundation.text.BasicTextField(
         value = value,
         onValueChange = onValueChange,
         enabled = enabled,
+        singleLine = true,                                            // 🌟 줄바꿈 대신 전송 키
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send), // 🌟 엔터키 → 전송(보내기) 아이콘
+        keyboardActions = KeyboardActions(onSend = { onSend() }),      // 🌟 전송 키 동작 연결
         textStyle = TextStyle(
             color = TextDark,
             fontSize = 16.sp
